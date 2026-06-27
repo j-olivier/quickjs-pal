@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <ConfigVersion>$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)VERSION').Trim())</ConfigVersion>
+    <OutDir>$(SolutionDir)bin\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)obj\$(Platform)\$(Configuration)\$(ProjectName)\</IntDir>
+  </PropertyGroup>
+  <PropertyGroup>
+    <ClangRtWindowsLibDir Condition="'$(Platform)'=='x64'">$(VsInstallRoot)\VC\Tools\Llvm\x64\lib\clang\$(LLVMIncludeVersion)\lib\windows</ClangRtWindowsLibDir>
+    <ClangRtWindowsLibDir Condition="'$(Platform)'=='Win32'">$(VsInstallRoot)\VC\Tools\Llvm\lib\clang\$(LLVMIncludeVersion)\lib\windows</ClangRtWindowsLibDir>
+    <ClangRtBuiltinsLib Condition="'$(Platform)'=='x64'">clang_rt.builtins-x86_64.lib</ClangRtBuiltinsLib>
+    <ClangRtBuiltinsLib Condition="'$(Platform)'=='Win32'">clang_rt.builtins-i386.lib</ClangRtBuiltinsLib>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>false</SDLCheck>
+      <ConformanceMode>false</ConformanceMode>
+      <AdditionalOptions>/clang:-std=gnu11 -Wno-sign-compare -Wno-unused-parameter -Wno-missing-field-initializers -Wno-microsoft-enum-forward-reference -Wno-ignored-attributes %(AdditionalOptions)</AdditionalOptions>
+      <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_WARNINGS;CONFIG_VERSION="$(ConfigVersion)";%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>$(ClangRtBuiltinsLib);%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ClangRtWindowsLibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+    </ClCompile>
+    <Link>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+    </Link>
+  </ItemDefinitionGroup>
+</Project>
