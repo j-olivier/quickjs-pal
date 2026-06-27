@@ -899,9 +899,52 @@ Use @code{JS_SetMemoryLimit()} to set a global memory allocation limit
 to a given JSRuntime.
 
 Custom memory allocation functions can be provided with
-@code{JS_NewRuntime2()}.
+@code{JS_NewRuntime2()}. Each allocator callback receives the
+@code{JSMallocState}, which carries the runtime's @code{JSPal} (see the
+Platform Abstraction Layer below). For this reason the
+@code{js_malloc_usable_size} callback now takes the
+@code{JSMallocState *} as its first argument.
 
 The maximum system stack size can be set with @code{JS_SetMaxStackSize()}.
+
+@subsection Platform Abstraction Layer (PAL)
+
+The engine core does not call the operating system directly. Every
+OS-dependent operation---memory allocation, wall-clock and monotonic
+time, the timezone offset, threads, mutexes, condition variables,
+atomics, and debug output---goes through a @dfn{Platform Abstraction
+Layer}, represented by the opaque type @code{JSPal}. This lets QuickJS
+be ported to a new host, including one with no standard C library or
+operating system, by supplying a single implementation of these
+primitives. The interface is declared in @code{quickjs-pal.h}; a default
+implementation (@code{quickjs-pal.c}) uses pthreads on Unix and the
+Win32 API on Windows.
+
+The PAL is passed to @code{JS_NewRuntime2()}:
+
+@example
+JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque,
+                          JSPal *pal);
+@end example
+
+@code{pal} may be @code{NULL}, in which case the default PAL is used;
+this is what @code{JS_NewRuntime()} does. @code{JS_GetRuntimePal()}
+returns the PAL of a runtime:
+
+@example
+JSPal *JS_GetRuntimePal(JSRuntime *rt);
+@end example
+
+Because the PAL replaces the previous direct use of @code{<stdio.h>},
+two existing functions now take a @code{JSPal *}. @code{JS_DumpMemoryUsage()}
+takes the @code{pal} to write its output to, instead of a @code{FILE *};
+and @code{JS_NewClassID()} takes a @code{pal} (it locks a mutex through
+the PAL to allocate the global class ID):
+
+@example
+void JS_DumpMemoryUsage(JSPal *pal, const JSMemoryUsage *s, JSRuntime *rt);
+JSClassID JS_NewClassID(JSClassID *pclass_id, JSPal *pal);
+@end example
 
 @subsection Execution timeout and interrupts
 

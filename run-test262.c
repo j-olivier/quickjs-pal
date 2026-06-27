@@ -29,20 +29,27 @@
 #include <string.h>
 #include <assert.h>
 #include <ctype.h>
+#if !defined(_MSC_VER)
 #include <unistd.h>
+#endif
 #include <errno.h>
 #include <time.h>
+#if !defined(_MSC_VER)
 #include <dirent.h>
 #include <ftw.h>
-#include <stdatomic.h>
-#include <pthread.h>
+#endif
 #ifdef _WIN32
 #include <windows.h>
+#if defined(_MSC_VER)
+/* provide POSIX emulation for MSVC */
+#include "quickjs-libc-win32-compat.h"
+#endif
 #endif
 
 #include "cutils.h"
 #include "list.h"
 #include "quickjs-libc.h"
+#include "quickjs-pal-overrides.h"
 
 #define CMD_NAME "run-test262"
 
@@ -90,6 +97,10 @@ namelist_t exclude_dir_list;
 namelist_t error_list;
 pthread_mutex_t error_list_mutex;
 
+/* Separate JSRuntime/JSPal for jspal_mutex_*(), apart from the test runtime. */
+JSRuntime *pal_rt;
+JSPal* pal;
+
 int nthreads;
 pthread_t progress_thread;
 BOOL progress_exit_request;
@@ -136,7 +147,7 @@ void fatal(int, const char *, ...) __attribute__((__format__(__printf__, 2, 3)))
 
 void atomic_inc(volatile _Atomic int *p)
 {
-    atomic_fetch_add(p, 1);
+    jspal_atomic_fetch_add_32((uint32_t*)p, 1);
 }
 
 #if defined(_WIN32)
@@ -781,21 +792,44 @@ static JSValue js_agent_receiveBroadcast(JSContext *ctx, JSValue this_val,
     return JS_UNDEFINED;
 }
 
+/* JSPal has no sleep; wait on a cond/mutex that is never signaled. */
+static void pal_sleep_ms(int64_t duration_ms)
+{
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    JSPalTime ts;
+
+    pthread_mutex_init(&mutex, NULL);
+    pthread_cond_init(&cond, NULL);
+    pthread_mutex_lock(&mutex);
+    jspal_get_time(pal, &ts);
+    ts.tv_sec += duration_ms / 1000;
+    ts.tv_usec += (duration_ms % 1000) * 1000;
+    if (ts.tv_usec >= 1000000) {
+        ts.tv_usec -= 1000000;
+        ts.tv_sec++;
+    }
+    pthread_cond_timedwait( &cond, &mutex, &ts);
+    pthread_mutex_unlock(&mutex);
+    pthread_cond_destroy(&cond);
+    pthread_mutex_destroy(&mutex);
+}
+
 static JSValue js_agent_sleep(JSContext *ctx, JSValue this_val,
                               int argc, JSValue *argv)
 {
     uint32_t duration;
     if (JS_ToUint32(ctx, &duration, argv[0]))
         return JS_EXCEPTION;
-    usleep(duration * 1000);
+    pal_sleep_ms(duration);
     return JS_UNDEFINED;
 }
 
 static int64_t get_clock_ms(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000 + (ts.tv_nsec / 1000000);
+    JSPalTime t;
+    jspal_get_time_monotonic(pal, &t);
+    return t.tv_sec * 1000 + (t.tv_usec / 1000);
 }
 
 static JSValue js_agent_monotonicNow(JSContext *ctx, JSValue this_val,
@@ -1519,7 +1553,7 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
                     }
                     printf("%s:%d: %sOK, now has error %s\n",
                            filename, error_line, strict_mode, msg);
-                    fixed_errors++;
+                    atomic_inc(&fixed_errors);
                 }
             } else {
                 if (!s) {   // not yet reported
@@ -1530,7 +1564,7 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
                         print_error("%s:%d: %sexpected error\n",
                                     filename, error_line, strict_mode);
                     }
-                    new_errors++;
+                    atomic_inc(&new_errors);
                 }
             }
         } else {            // should not have error
@@ -1549,15 +1583,15 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
 
                     if (s && (!str_equal(s, msg) || error_line != s_line)) {
                         printf("%s:%d: %sprevious error: %s\n", filename, s_line, strict_mode, s);
-                        changed_errors++;
+                        atomic_inc(&changed_errors);
                     } else {
-                        new_errors++;
+                        atomic_inc(&new_errors);
                     }
                 }
             } else {
                 if (s) {
                     printf("%s:%d: %sOK, fixed error: %s\n", filename, s_line, strict_mode, s);
-                    fixed_errors++;
+                    atomic_inc(&fixed_errors);
                 }
             }
         }
@@ -2109,13 +2143,13 @@ int run_test262_harness_test(ThreadLocalStorage *tls,
 
 static int pthread_cond_timedwait2(pthread_cond_t *cond, pthread_mutex_t *mutex, int timeout)
 {
-    struct timespec ts;
+    JSPalTime ts;
 
-    clock_gettime(CLOCK_REALTIME, &ts);
+    jspal_get_time(pal, &ts);
     ts.tv_sec += timeout / 1000;
-    ts.tv_nsec += (timeout % 1000) * 1000000;
-    if (ts.tv_nsec >= 1000000000) {
-        ts.tv_nsec -= 1000000000;
+    ts.tv_usec += (timeout % 1000) * 1000;
+    if (ts.tv_usec >= 1000000) {
+        ts.tv_usec -= 1000000;
         ts.tv_sec++;
     }
     return pthread_cond_timedwait(cond, mutex, &ts);
@@ -2129,9 +2163,9 @@ void *show_progress(void *opaque)
     for(;;) {
         pthread_cond_timedwait2(&progress_cond, &progress_mutex, 50);
 
-        test_failed1 = atomic_load(&test_failed);
-        test_count1 = atomic_load(&test_count);
-        test_skipped1 = atomic_load(&test_skipped);
+        test_failed1 = (int)jspal_atomic_load_32((uint32_t*)&test_failed);
+        test_count1 = (int)jspal_atomic_load_32((uint32_t*)&test_count);
+        test_skipped1 = (int)jspal_atomic_load_32((uint32_t*)&test_skipped);
 
         if (compact) {
             static int last_test_skipped;
@@ -2261,6 +2295,11 @@ int main(int argc, char **argv)
     BOOL count_skipped_features = FALSE;
     clock_t clocks;
     
+    pal_rt = JS_NewRuntime();
+    if (!pal_rt)
+        fatal(1, "JS_NewRuntime failure");
+    pal = JS_GetRuntimePal(pal_rt);
+
     init_thread_local_storage(tls);
     pthread_mutex_init(&stats_mutex, NULL);
     pthread_mutex_init(&error_list_mutex, NULL);
@@ -2471,12 +2510,12 @@ int main(int argc, char **argv)
     if (dump_memory) {
         if (dump_memory > 1 && stats_count > 1) {
             printf("\nMininum memory statistics for %s:\n\n", stats_min_filename);
-            JS_DumpMemoryUsage(stdout, &stats_min, NULL);
+            JS_DumpMemoryUsage(pal, &stats_min, NULL);
             printf("\nMaximum memory statistics for %s:\n\n", stats_max_filename);
-            JS_DumpMemoryUsage(stdout, &stats_max, NULL);
+            JS_DumpMemoryUsage(pal, &stats_max, NULL);
         }
         printf("\nAverage memory statistics for %d tests:\n\n", stats_count);
-        JS_DumpMemoryUsage(stdout, &stats_avg, NULL);
+        JS_DumpMemoryUsage(pal, &stats_avg, NULL);
         printf("\n");
     }
 
@@ -2549,6 +2588,8 @@ int main(int argc, char **argv)
     free(harness_features);
     free(harness_exclude);
     free(error_file);
+
+    JS_FreeRuntime(pal_rt);
 
     /* Signal that the error file is out of date. */
     return new_errors || changed_errors || fixed_errors;
