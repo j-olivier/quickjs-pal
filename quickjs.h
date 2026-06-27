@@ -29,6 +29,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "quickjs-pal.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -37,15 +39,11 @@ extern "C" {
 #define js_likely(x)          __builtin_expect(!!(x), 1)
 #define js_unlikely(x)        __builtin_expect(!!(x), 0)
 #define js_force_inline       inline __attribute__((always_inline))
-#define __js_printf_like(f, a)   __attribute__((format(printf, f, a)))
 #else
 #define js_likely(x)     (x)
 #define js_unlikely(x)   (x)
 #define js_force_inline  inline
-#define __js_printf_like(a, b)
 #endif
-
-#define JS_BOOL int
 
 typedef struct JSRuntime JSRuntime;
 typedef struct JSContext JSContext;
@@ -355,13 +353,14 @@ typedef struct JSMallocState {
     size_t malloc_size;
     size_t malloc_limit;
     void *opaque; /* user opaque */
+    JSPal *pal;
 } JSMallocState;
 
 typedef struct JSMallocFunctions {
     void *(*js_malloc)(JSMallocState *s, size_t size);
     void (*js_free)(JSMallocState *s, void *ptr);
     void *(*js_realloc)(JSMallocState *s, void *ptr, size_t size);
-    size_t (*js_malloc_usable_size)(const void *ptr);
+    size_t (*js_malloc_usable_size)(JSMallocState *s, const void *ptr);
 } JSMallocFunctions;
 
 typedef struct JSGCObjectHeader JSGCObjectHeader;
@@ -376,10 +375,11 @@ void JS_SetMaxStackSize(JSRuntime *rt, size_t stack_size);
 /* should be called when changing thread to update the stack top value
    used to check stack overflow. */
 void JS_UpdateStackTop(JSRuntime *rt);
-JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque);
+JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque, JSPal *pal);
 void JS_FreeRuntime(JSRuntime *rt);
 void *JS_GetRuntimeOpaque(JSRuntime *rt);
 void JS_SetRuntimeOpaque(JSRuntime *rt, void *opaque);
+JSPal *JS_GetRuntimePal(JSRuntime *rt);
 typedef void JS_MarkFunc(JSRuntime *rt, JSGCObjectHeader *gp);
 void JS_MarkValue(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
 void JS_RunGC(JSRuntime *rt);
@@ -445,7 +445,7 @@ typedef struct JSMemoryUsage {
 } JSMemoryUsage;
 
 void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s);
-void JS_DumpMemoryUsage(FILE *fp, const JSMemoryUsage *s, JSRuntime *rt);
+void JS_DumpMemoryUsage(JSPal *pal, const JSMemoryUsage *s, JSRuntime *rt);
 
 /* atom support */
 #define JS_ATOM_NULL 0
@@ -544,7 +544,7 @@ typedef struct JSClassDef {
 } JSClassDef;
 
 #define JS_INVALID_CLASS_ID 0
-JSClassID JS_NewClassID(JSClassID *pclass_id);
+JSClassID JS_NewClassID(JSClassID *pclass_id, JSPal *pal);
 /* Returns the class ID if `v` is an object, otherwise returns JS_INVALID_CLASS_ID. */
 JSClassID JS_GetClassID(JSValue v);
 int JS_NewClass(JSRuntime *rt, JSClassID class_id, const JSClassDef *class_def);

@@ -28,17 +28,7 @@
 #include <inttypes.h>
 #include <string.h>
 #include <assert.h>
-#include <sys/time.h>
-#include <time.h>
-#include <fenv.h>
 #include <math.h>
-#if defined(__APPLE__)
-#include <malloc/malloc.h>
-#elif defined(__linux__) || defined(__GLIBC__)
-#include <malloc.h>
-#elif defined(__FreeBSD__)
-#include <malloc_np.h>
-#endif
 
 #include "cutils.h"
 #include "list.h"
@@ -46,6 +36,19 @@
 #include "libregexp.h"
 #include "libunicode.h"
 #include "dtoa.h"
+#include "quickjs-pal.h"
+#include "quickjs-pal-overrides.h"
+
+// PAL redirections
+#define fprintf(pal, ...) jspal_printf(pal, __VA_ARGS__)
+#define fputc(c, pal) jspal_printf(pal, "%c", c)
+#define printf(...) jspal_printf(rt->pal, __VA_ARGS__)
+
+
+/* Only js_def_malloc & co below use the OS allocator; other names are blocked. */
+#define malloc(s) malloc_is_forbidden(s)
+#define free(p) free_is_forbidden(p)
+#define realloc(p,s) realloc_is_forbidden(p,s)
 
 #define OPTIMIZE         1
 #define SHORT_OPCODES    1
@@ -112,12 +115,6 @@
 
 /* test the GC by forcing it before each object allocation */
 //#define FORCE_GC_AT_MALLOC
-
-#ifdef CONFIG_ATOMICS
-#include <pthread.h>
-#include <stdatomic.h>
-#include <errno.h>
-#endif
 
 enum {
     /* classid tag        */    /* union usage   | properties */
@@ -318,6 +315,7 @@ typedef struct {
 
 struct JSRuntime {
     JSMallocContext malloc_ctx;
+    JSPal* pal; /* opaque data for jspal OS primitives */
     const char *rt_info;
 
     int atom_hash_size; /* power of two */
@@ -622,7 +620,8 @@ typedef enum {
 } JSClosureTypeEnum;
 
 typedef struct JSClosureVar {
-    JSClosureTypeEnum closure_type : 3;
+    /* uint8_t, not the enum, to keep the bit-field unsigned. */
+    uint8_t closure_type : 3; /* JSClosureTypeEnum */
     uint8_t is_lexical : 1; /* lexical variable */
     uint8_t is_const : 1; /* const variable (is_lexical = 1 if is_const = 1 */
     uint8_t var_kind : 4; /* see JSVarKindEnum */
@@ -1710,7 +1709,7 @@ static size_t __js_malloc_usable_size(JSMallocContext *s, const char *ptr)
             size_t size;
             lb = container_of(ptr, JSMallocLargeBlockHeader, header.user_data);
             if (s->mf.js_malloc_usable_size) {
-                size = s->mf.js_malloc_usable_size(lb);
+                size = s->mf.js_malloc_usable_size(&s->malloc_state, lb);
                 if (size != 0)
                     size -= sizeof(JSMallocLargeBlockHeader);
                 return size;
@@ -1724,10 +1723,11 @@ static size_t __js_malloc_usable_size(JSMallocContext *s, const char *ptr)
     }
 }
 
-static __maybe_unused void js_malloc_dump_arenas(JSMallocContext *s)
+static __maybe_unused void js_malloc_dump_arenas(JSRuntime *rt)
 {
     struct list_head *el;
     int block_size_idx;
+    JSMallocContext* s = &rt->malloc_ctx;
 
     printf("%20s %10s %10s\n", "PTR", "BLK_SIZE", "ALLOC");
     for(block_size_idx = 0; block_size_idx < JS_MALLOC_BLOCK_SIZE_COUNT; block_size_idx++) {
@@ -2064,15 +2064,17 @@ static inline BOOL js_check_stack_overflow(JSRuntime *rt, size_t alloca_size)
 }
 #endif
 
-JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
+JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque, JSPal *pal)
 {
     JSRuntime *rt;
     JSMallocState ms;
 
     memset(&ms, 0, sizeof(ms));
+    ms.pal = pal;
     ms.opaque = opaque;
     ms.malloc_limit = -1;
 
+    /* rt not created yet; use resolved_pal here, not &rt->pal. */
     rt = mf->js_malloc(&ms, sizeof(JSRuntime));
     if (!rt)
         return NULL;
@@ -2080,6 +2082,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     js_malloc_init(&rt->malloc_ctx);
     rt->malloc_ctx.mf = *mf;
     rt->malloc_ctx.malloc_state = ms;
+    rt->pal = pal;
     rt->malloc_gc_threshold = 256 * 1024;
 
     init_list_head(&rt->context_list);
@@ -2123,6 +2126,11 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     return NULL;
 }
 
+JSPal *JS_GetRuntimePal(JSRuntime *rt)
+{
+    return rt->pal;
+}
+
 void *JS_GetRuntimeOpaque(JSRuntime *rt)
 {
     return rt->user_opaque;
@@ -2134,20 +2142,9 @@ void JS_SetRuntimeOpaque(JSRuntime *rt, void *opaque)
 }
 
 /* default memory allocation functions with memory limitation */
-static size_t js_def_malloc_usable_size(const void *ptr)
+static size_t js_def_malloc_usable_size(JSMallocState *s, const void *ptr)
 {
-#if defined(__APPLE__)
-    return malloc_size(ptr);
-#elif defined(_WIN32)
-    return _msize((void *)ptr);
-#elif defined(__EMSCRIPTEN__)
-    return 0;
-#elif defined(__linux__) || defined(__GLIBC__)
-    return malloc_usable_size((void *)ptr);
-#else
-    /* change this to `return 0;` if compilation fails */
-    return malloc_usable_size((void *)ptr);
-#endif
+    return jspal_malloc_usable_size(s->opaque, ptr);
 }
 
 static void *js_def_malloc(JSMallocState *s, size_t size)
@@ -2160,12 +2157,12 @@ static void *js_def_malloc(JSMallocState *s, size_t size)
     if (unlikely(s->malloc_size + size > s->malloc_limit))
         return NULL;
 
-    ptr = malloc(size);
+    ptr = jspal_malloc(s->opaque, size);
     if (!ptr)
         return NULL;
 
     s->malloc_count++;
-    s->malloc_size += js_def_malloc_usable_size(ptr) + MALLOC_OVERHEAD;
+    s->malloc_size += js_def_malloc_usable_size(s, ptr) + MALLOC_OVERHEAD;
     return ptr;
 }
 
@@ -2175,8 +2172,8 @@ static void js_def_free(JSMallocState *s, void *ptr)
         return;
 
     s->malloc_count--;
-    s->malloc_size -= js_def_malloc_usable_size(ptr) + MALLOC_OVERHEAD;
-    free(ptr);
+    s->malloc_size -= js_def_malloc_usable_size(s, ptr) + MALLOC_OVERHEAD;
+    jspal_free(s->opaque, ptr);
 }
 
 static void *js_def_realloc(JSMallocState *s, void *ptr, size_t size)
@@ -2188,21 +2185,21 @@ static void *js_def_realloc(JSMallocState *s, void *ptr, size_t size)
             return NULL;
         return js_def_malloc(s, size);
     }
-    old_size = js_def_malloc_usable_size(ptr);
+    old_size = js_def_malloc_usable_size(s, ptr);
     if (size == 0) {
         s->malloc_count--;
         s->malloc_size -= old_size + MALLOC_OVERHEAD;
-        free(ptr);
+        jspal_free(s->opaque, ptr);
         return NULL;
     }
     if (s->malloc_size + size - old_size > s->malloc_limit)
         return NULL;
 
-    ptr = realloc(ptr, size);
+    ptr = jspal_realloc(s->opaque, ptr, size);
     if (!ptr)
         return NULL;
 
-    s->malloc_size += js_def_malloc_usable_size(ptr) - old_size;
+    s->malloc_size += js_def_malloc_usable_size(s, ptr) - old_size;
     return ptr;
 }
 
@@ -2215,7 +2212,7 @@ static const JSMallocFunctions def_malloc_funcs = {
 
 JSRuntime *JS_NewRuntime(void)
 {
-    return JS_NewRuntime2(&def_malloc_funcs, NULL);
+    return JS_NewRuntime2(&def_malloc_funcs, NULL, NULL);
 }
 
 void JS_SetMemoryLimit(JSRuntime *rt, size_t limit)
@@ -2228,10 +2225,6 @@ void JS_SetGCThreshold(JSRuntime *rt, size_t gc_threshold)
 {
     rt->malloc_gc_threshold = gc_threshold;
 }
-
-#define malloc(s) malloc_is_forbidden(s)
-#define free(p) free_is_forbidden(p)
-#define realloc(p,s) realloc_is_forbidden(p,s)
 
 void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
 {
@@ -2794,7 +2787,7 @@ void JS_FreeContext(JSContext *ctx)
     {
         JSMemoryUsage stats;
         JS_ComputeMemoryUsage(rt, &stats);
-        JS_DumpMemoryUsage(stdout, &stats, rt);
+        JS_DumpMemoryUsage(&rt->pal, &stats, rt);
     }
 #endif
 
@@ -2978,8 +2971,9 @@ static uint32_t hash_string_rope(JSValueConst val, uint32_t h)
     }
 }
 
-static __maybe_unused void JS_DumpChar(FILE *fo, int c, int sep)
+static __maybe_unused void JS_DumpChar(JSRuntime* rt, int c, int sep)
 {
+    JSPal* fo = rt->pal;
     if (c == sep || c == '\\') {
         fputc('\\', fo);
         fputc(c, fo);
@@ -3005,7 +2999,7 @@ static __maybe_unused void JS_DumpString(JSRuntime *rt, const JSString *p)
     sep = (js_rc((void *)p)->ref_count == 1) ? '\"' : '\'';
     putchar(sep);
     for(i = 0; i < p->len; i++) {
-        JS_DumpChar(stdout, string_get(p, i), sep);
+        JS_DumpChar(rt, string_get(p, i), sep);
     }
     putchar(sep);
 }
@@ -3816,14 +3810,32 @@ static inline BOOL JS_IsEmptyString(JSValueConst v)
 /* JSClass support */
 
 #ifdef CONFIG_ATOMICS
-static pthread_mutex_t js_class_id_mutex = PTHREAD_MUTEX_INITIALIZER;
+static void js_pal_mutex_lazy_init(JSPal *pal, pthread_mutex_t *mutex, uint32_t *state)
+{
+    uint32_t expected;
+    for (;;) {
+        expected = jspal_atomic_load_32(state);
+        if (expected == 2)
+            return;
+        if (expected == 0 &&
+            jspal_atomic_compare_exchange_32(state, &expected, 1)) {
+            jspal_mutex_init(pal, mutex);
+            jspal_atomic_store_32(state, 2);
+            return;
+        }
+    }
+}
+
+static pthread_mutex_t js_class_id_mutex;
+static uint32_t js_class_id_mutex_state;
 #endif
 
 /* a new class ID is allocated if *pclass_id != 0 */
-JSClassID JS_NewClassID(JSClassID *pclass_id)
+JSClassID JS_NewClassID(JSClassID *pclass_id, JSPal *pal)
 {
     JSClassID class_id;
 #ifdef CONFIG_ATOMICS
+    js_pal_mutex_lazy_init(pal, &js_class_id_mutex, &js_class_id_mutex_state);
     pthread_mutex_lock(&js_class_id_mutex);
 #endif
     class_id = *pclass_id;
@@ -6032,7 +6044,7 @@ static JSValue js_c_function_data_call(JSContext *ctx, JSValueConst func_obj,
 
     /* XXX: could add the function on the stack for debug */
     if (unlikely(argc < s->length)) {
-        arg_buf = alloca(sizeof(arg_buf[0]) * s->length);
+        arg_buf = __builtin_alloca(sizeof(arg_buf[0]) * s->length);
         for(i = 0; i < argc; i++)
             arg_buf[i] = argv[i];
         for(i = argc; i < s->length; i++)
@@ -7221,7 +7233,7 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
         s->js_func_size + s->js_func_code_size + s->js_func_pc2line_size;
 }
 
-void JS_DumpMemoryUsage(FILE *fp, const JSMemoryUsage *s, JSRuntime *rt)
+void JS_DumpMemoryUsage(JSPal *fp, const JSMemoryUsage *s, JSRuntime *rt)
 {
     fprintf(fp, "QuickJS memory usage -- " CONFIG_VERSION " version, %d-bit, malloc limit: %"PRId64"\n\n",
             (int)sizeof(void *) * 8, s->malloc_limit);
@@ -11639,6 +11651,7 @@ static __maybe_unused void js_bigint_dump1(JSContext *ctx, const char *str,
                                            const js_limb_t *tab, int len)
 {
     int i;
+    JSRuntime* rt = ctx->rt;
     printf("%s: ", str);
     for(i = len - 1; i >= 0; i--) {
 #if JS_LIMB_BITS == 32
@@ -12772,7 +12785,7 @@ static JSValue js_atof(JSContext *ctx, const char *str, const char **pp,
     BOOL buf_allocated = FALSE;
     JSValue val;
     JSATODTempMem atod_mem;
-    
+
     /* optional separator between digits */
     sep = (flags & ATOD_ACCEPT_UNDERSCORES) ? '_' : 256;
     has_legacy_octal = FALSE;
@@ -14445,8 +14458,8 @@ void JS_PrintValue(JSContext *ctx, JSPrintValueWrite *write_func, void *write_op
 
 static void js_dump_value_write(void *opaque, const char *buf, size_t len)
 {
-    FILE *fo = opaque;
-    fwrite(buf, 1, len, fo);
+    JSRuntime *rt = opaque;
+    printf("%.*s", (int)len, buf);
 }
 
 static __maybe_unused void print_atom(JSContext *ctx, JSAtom atom)
@@ -14456,12 +14469,13 @@ static __maybe_unused void print_atom(JSContext *ctx, JSAtom atom)
     s->rt = ctx->rt;
     s->ctx = ctx;
     s->write_func = js_dump_value_write;
-    s->write_opaque = stdout;
+    s->write_opaque = ctx->rt;
     js_print_atom(s, atom);
 }
 
 static __maybe_unused void JS_DumpAtom(JSContext *ctx, const char *str, JSAtom atom)
 {
+    JSRuntime* rt = ctx->rt;
     printf("%s=", str);
     print_atom(ctx, atom);
     printf("\n");
@@ -14469,15 +14483,16 @@ static __maybe_unused void JS_DumpAtom(JSContext *ctx, const char *str, JSAtom a
 
 static __maybe_unused void JS_DumpValue(JSContext *ctx, const char *str, JSValueConst val)
 {
+    JSRuntime* rt = ctx->rt;
     printf("%s=", str);
-    JS_PrintValue(ctx, js_dump_value_write, stdout, val, NULL);
+    JS_PrintValue(ctx, js_dump_value_write, rt, val, NULL);
     printf("\n");
 }
 
 static __maybe_unused void JS_DumpValueRT(JSRuntime *rt, const char *str, JSValueConst val)
 {
     printf("%s=", str);
-    JS_PrintValueRT(rt, js_dump_value_write, stdout, val, NULL);
+    JS_PrintValueRT(rt, js_dump_value_write, rt, val, NULL);
     printf("\n");
 }
 
@@ -14511,7 +14526,7 @@ static __maybe_unused void JS_DumpObject(JSRuntime *rt, JSObject *p)
     options.max_depth = 1;
     options.show_hidden = TRUE;
     options.raw_dump = TRUE;
-    JS_PrintValueRT(rt, js_dump_value_write, stdout, JS_MKPTR(JS_TAG_OBJECT, p), &options);
+    JS_PrintValueRT(rt, js_dump_value_write, rt, JS_MKPTR(JS_TAG_OBJECT, p), &options);
 
     printf("\n");
 }
@@ -15421,12 +15436,16 @@ static int js_compare_bigint(JSContext *ctx, OPCodeEnum op,
     } else {
         if (tag1 == JS_TAG_FLOAT64) {
             p2 = JS_ToBigIntBuf(ctx, &buf2, op2);
+            if (!p2)
+                goto unordered;
             val = js_bigint_float64_cmp(ctx, p2, JS_VALUE_GET_FLOAT64(op1));
             if (val == 2)
                 goto unordered;
             val = -val;
         } else if (tag2 == JS_TAG_FLOAT64) {
             p1 = JS_ToBigIntBuf(ctx, &buf1, op1);
+            if (!p1)
+                goto unordered;
             val = js_bigint_float64_cmp(ctx, p1, JS_VALUE_GET_FLOAT64(op2));
             if (val == 2) {
             unordered:
@@ -15437,6 +15456,8 @@ static int js_compare_bigint(JSContext *ctx, OPCodeEnum op,
         } else {
             p1 = JS_ToBigIntBuf(ctx, &buf1, op1);
             p2 = JS_ToBigIntBuf(ctx, &buf2, op2);
+            if (!p1 || !p2)
+                goto unordered;
             val = js_bigint_cmp(ctx, p1, p2);
         }
         JS_FreeValue(ctx, op1);
@@ -17591,7 +17612,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
 
     if (unlikely(argc < arg_count)) {
         /* ensure that at least argc_count arguments are readable */
-        arg_buf = alloca(sizeof(arg_buf[0]) * arg_count);
+        arg_buf = __builtin_alloca(sizeof(arg_buf[0]) * arg_count);
         for(i = 0; i < argc; i++)
             arg_buf[i] = argv[i];
         for(i = argc; i < arg_count; i++)
@@ -17702,7 +17723,7 @@ static JSValue js_call_bound_function(JSContext *ctx, JSValueConst func_obj,
     arg_count = bf->argc + argc;
     if (js_check_stack_overflow(ctx->rt, sizeof(JSValue) * arg_count))
         return JS_ThrowStackOverflow(ctx);
-    arg_buf = alloca(sizeof(JSValue) * arg_count);
+    arg_buf = __builtin_alloca(sizeof(JSValue) * arg_count);
     for(i = 0; i < bf->argc; i++) {
         arg_buf[i] = bf->argv[i];
     }
@@ -17843,7 +17864,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     sf->cur_func = (JSValue)func_obj;
     var_refs = p->u.func.var_refs;
 
-    local_buf = alloca(alloca_size);
+    local_buf = __builtin_alloca(alloca_size);
     if (unlikely(arg_allocated_size)) {
         int n = min_int(argc, b->arg_count);
         arg_buf = local_buf;
@@ -22217,6 +22238,7 @@ static void free_token(JSParseState *s, JSToken *token)
 static void __attribute((unused)) dump_token(JSParseState *s,
                                              const JSToken *token)
 {
+    JSRuntime* rt = s->ctx->rt;
     switch(token->val) {
     case TOK_NUMBER:
         {
@@ -38381,6 +38403,7 @@ typedef struct BCReaderState {
 
 #ifdef DUMP_READ_OBJECT
 static void __attribute__((format(printf, 2, 3))) bc_read_trace(BCReaderState *s, const char *fmt, ...) {
+    JSRuntime *rt = s->ctx->rt;
     va_list ap;
     int i, n, n0;
 
@@ -38562,6 +38585,9 @@ static int bc_get_atom(BCReaderState *s, JSAtom *patom)
 
 static JSString *JS_ReadString(BCReaderState *s)
 {
+#ifdef DUMP_READ_OBJECT
+    JSRuntime *rt = s->ctx->rt;
+#endif
     uint32_t len;
     size_t size;
     BOOL is_wide_char;
@@ -38615,6 +38641,9 @@ static uint32_t bc_get_flags(uint32_t flags, int *pidx, int n)
 static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
                                    int byte_code_offset, uint32_t bc_len)
 {
+#ifdef DUMP_READ_OBJECT
+    JSRuntime *rt = s->ctx->rt;
+#endif
     uint8_t *bc_buf;
     int pos, len, op;
     JSAtom atom;
@@ -38744,6 +38773,9 @@ static int BC_add_object_ref(BCReaderState *s, JSValueConst obj)
 static JSValue JS_ReadFunctionTag(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
+#ifdef DUMP_READ_OBJECT
+    JSRuntime *rt = ctx->rt;
+#endif
     JSFunctionBytecode bc, *b;
     JSValue obj = JS_UNDEFINED;
     uint16_t v16;
@@ -38916,7 +38948,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         if (bc_get_leb128_int(s, &b->debug.source_len))
             goto fail;
         if (b->debug.source_len) {
-            bc_read_trace(s, "source: %d bytes\n", b->source_len);
+            bc_read_trace(s, "source: %d bytes\n", b->debug.source_len);
             b->debug.source = js_mallocz(ctx, b->debug.source_len);
             if (!b->debug.source)
                 goto fail;
@@ -38946,6 +38978,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
 static JSValue JS_ReadModule(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
+#ifdef DUMP_READ_OBJECT
+    JSRuntime *rt = ctx->rt;
+#endif
     JSValue obj;
     JSModuleDef *m = NULL;
     JSAtom module_name;
@@ -39060,6 +39095,9 @@ static JSValue JS_ReadModule(BCReaderState *s)
 static JSValue JS_ReadObjectTag(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
+#ifdef DUMP_READ_OBJECT
+    JSRuntime *rt = ctx->rt;
+#endif
     JSValue obj;
     uint32_t prop_count, i;
     JSAtom atom;
@@ -47372,8 +47410,8 @@ static uint64_t xorshift64star(uint64_t *pstate)
 
 static void js_random_init(JSContext *ctx)
 {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
+    JSPalTime tv;
+    jspal_get_time(ctx->rt->pal, &tv);
     ctx->random_state = ((int64_t)tv.tv_sec * 1000000) + tv.tv_usec;
     /* the state must be non zero */
     if (ctx->random_state == 0)
@@ -47451,58 +47489,9 @@ static const JSCFunctionListEntry js_math_obj[] = {
 
 /* OS dependent. d = argv[0] is in ms from 1970. Return the difference
    between UTC time and local time 'd' in minutes */
-static int getTimezoneOffset(int64_t time)
+static int getTimezoneOffset(int64_t time, JSPal *pal)
 {
-    time_t ti;
-    int res;
-
-    time /= 1000; /* convert to seconds */
-    if (sizeof(time_t) == 4) {
-        /* on 32-bit systems, we need to clamp the time value to the
-           range of `time_t`. This is better than truncating values to
-           32 bits and hopefully provides the same result as 64-bit
-           implementation of localtime_r.
-         */
-        if ((time_t)-1 < 0) {
-            if (time < INT32_MIN) {
-                time = INT32_MIN;
-            } else if (time > INT32_MAX) {
-                time = INT32_MAX;
-            }
-        } else {
-            if (time < 0) {
-                time = 0;
-            } else if (time > UINT32_MAX) {
-                time = UINT32_MAX;
-            }
-        }
-    }
-    ti = time;
-#if defined(_WIN32)
-    {
-        struct tm *tm;
-        time_t gm_ti, loc_ti;
-
-        tm = gmtime(&ti);
-        if (!tm)
-            return 0;
-        gm_ti = mktime(tm);
-
-        tm = localtime(&ti);
-        if (!tm)
-            return 0;
-        loc_ti = mktime(tm);
-
-        res = (gm_ti - loc_ti) / 60;
-    }
-#else
-    {
-        struct tm tm;
-        localtime_r(&ti, &tm);
-        res = -tm.tm_gmtoff / 60;
-    }
-#endif
-    return res;
+    return jspal_get_timezone_offset(pal, time);
 }
 
 #if 0
@@ -47516,7 +47505,7 @@ static JSValue js___date_getTimezoneOffset(JSContext *ctx, JSValueConst this_val
     if (isnan(dd))
         return __JS_NewFloat64(ctx, dd);
     else
-        return JS_NewInt32(ctx, getTimezoneOffset((int64_t)dd));
+        return JS_NewInt32(ctx, getTimezoneOffset((int64_t)dd, ctx->rt->pal));
 }
 
 static JSValue js_get_prototype_from_ctor(JSContext *ctx, JSValueConst ctor,
@@ -55103,7 +55092,7 @@ static __exception int get_date_fields(JSContext *ctx, JSValueConst obj,
     } else {
         d = dval;     /* assuming -8.64e15 <= dval <= -8.64e15 */
         if (is_local) {
-            tz = -getTimezoneOffset(d);
+            tz = -getTimezoneOffset(d, ctx->rt->pal);
             d += tz * 60000;
         }
     }
@@ -55149,7 +55138,7 @@ static double time_clip(double t) {
 
 /* The spec mandates the use of 'double' and it specifies the order
    of the operations */
-static double set_date_fields(double fields[minimum_length(7)], int is_local) {
+static double set_date_fields(double fields[minimum_length(7)], int is_local, JSPal *pal) {
     double y, m, dt, ym, mn, day, h, s, milli, time, tv;
     int yi, mi, i;
     int64_t days;
@@ -55201,12 +55190,12 @@ static double set_date_fields(double fields[minimum_length(7)], int is_local) {
     /* adjust for local time and clip */
     if (is_local) {
         int64_t ti = tv < INT64_MIN ? INT64_MIN : tv >= 0x1p63 ? INT64_MAX : (int64_t)tv;
-        tv += getTimezoneOffset(ti) * 60000;
+        tv += getTimezoneOffset(ti, pal) * 60000;
     }
     return time_clip(tv);
 }
 
-static double set_date_fields_checked(double fields[minimum_length(7)], int is_local)
+static double set_date_fields_checked(double fields[minimum_length(7)], int is_local, JSPal *pal)
 {
     int i;
     double a;
@@ -55218,7 +55207,7 @@ static double set_date_fields_checked(double fields[minimum_length(7)], int is_l
         if (i == 0 && fields[0] >= 0 && fields[0] < 100)
             fields[0] += 1900;
     }
-    return set_date_fields(fields, is_local);
+    return set_date_fields(fields, is_local, pal);
 }
 
 static JSValue get_date_field(JSContext *ctx, JSValueConst this_val,
@@ -55274,7 +55263,7 @@ static JSValue set_date_field(JSContext *ctx, JSValueConst this_val,
         return JS_NAN; /* thisTimeValue is NaN */
 
     if (res && argc > 0)
-        d = set_date_fields(fields, is_local);
+        d = set_date_fields(fields, is_local, ctx->rt->pal);
 
     return JS_SetThisTimeValue(ctx, this_val, d);
 }
@@ -55394,9 +55383,9 @@ static JSValue get_date_string(JSContext *ctx, JSValueConst this_val,
 }
 
 /* OS dependent: return the UTC time in ms since 1970. */
-static int64_t date_now(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
+static int64_t date_now(JSRuntime *rt) {
+    JSPalTime tv;
+    jspal_get_time(rt->pal, &tv);
     return (int64_t)tv.tv_sec * 1000 + (tv.tv_usec / 1000);
 }
 
@@ -55414,7 +55403,7 @@ static JSValue js_date_constructor(JSContext *ctx, JSValueConst new_target,
     }
     n = argc;
     if (n == 0) {
-        val = date_now();
+        val = date_now(ctx->rt);
     } else if (n == 1) {
         JSValue v, dv;
         if (JS_VALUE_GET_TAG(argv[0]) == JS_TAG_OBJECT) {
@@ -55447,7 +55436,7 @@ static JSValue js_date_constructor(JSContext *ctx, JSValueConst new_target,
             if (JS_ToFloat64(ctx, &fields[i], argv[i]))
                 return JS_EXCEPTION;
         }
-        val = set_date_fields_checked(fields, 1);
+        val = set_date_fields_checked(fields, 1, ctx->rt->pal);
     }
 has_val:
 #if 0
@@ -55487,7 +55476,7 @@ static JSValue js_Date_UTC(JSContext *ctx, JSValueConst this_val,
         if (JS_ToFloat64(ctx, &fields[i], argv[i]))
             return JS_EXCEPTION;
     }
-    return JS_NewFloat64(ctx, set_date_fields_checked(fields, 0));
+    return JS_NewFloat64(ctx, set_date_fields_checked(fields, 0, ctx->rt->pal));
 }
 
 /* Date string parsing */
@@ -55946,7 +55935,7 @@ static JSValue js_Date_parse(JSContext *ctx, JSValueConst this_val,
         if (valid) {
             for(i = 0; i < 7; i++)
                 fields1[i] = fields[i];
-            d = set_date_fields(fields1, is_local) - fields[8] * 60000;
+            d = set_date_fields(fields1, is_local, ctx->rt->pal) - fields[8] * 60000;
             rv = JS_NewFloat64(ctx, d);
         }
     }
@@ -55958,7 +55947,7 @@ static JSValue js_Date_now(JSContext *ctx, JSValueConst this_val,
                            int argc, JSValueConst *argv)
 {
     // now()
-    return JS_NewInt64(ctx, date_now());
+    return JS_NewInt64(ctx, date_now(ctx->rt));
 }
 
 static JSValue js_date_Symbol_toPrimitive(JSContext *ctx, JSValueConst this_val,
@@ -56005,7 +55994,7 @@ static JSValue js_date_getTimezoneOffset(JSContext *ctx, JSValueConst this_val,
         return JS_NAN;
     else
         /* assuming -8.64e15 <= v <= -8.64e15 */
-        return JS_NewInt64(ctx, getTimezoneOffset((int64_t)trunc(v)));
+        return JS_NewInt64(ctx, getTimezoneOffset((int64_t)trunc(v), ctx->rt->pal));
 }
 
 static JSValue js_date_getTime(JSContext *ctx, JSValueConst this_val,
@@ -60634,18 +60623,18 @@ static JSValue js_atomics_op(JSContext *ctx,
     
     switch(op | (size_log2 << 3)) {
 
-#define OP(op_name, func_name)                          \
-    case ATOMICS_OP_ ## op_name | (0 << 3):             \
-       a = func_name((_Atomic(uint8_t) *)ptr, v);       \
-       break;                                           \
-    case ATOMICS_OP_ ## op_name | (1 << 3):             \
-        a = func_name((_Atomic(uint16_t) *)ptr, v);     \
-        break;                                          \
-    case ATOMICS_OP_ ## op_name | (2 << 3):             \
-        a = func_name((_Atomic(uint32_t) *)ptr, v);     \
-        break;                                          \
-    case ATOMICS_OP_ ## op_name | (3 << 3):             \
-        a = func_name((_Atomic(uint64_t) *)ptr, v);     \
+#define OP(op_name, func_name)                            \
+    case ATOMICS_OP_ ## op_name | (0 << 3):               \
+       a = jspal_ ## func_name ## _8((uint8_t *)ptr, v);  \
+       break;                                             \
+    case ATOMICS_OP_ ## op_name | (1 << 3):                 \
+        a = jspal_ ## func_name ## _16((uint16_t *)ptr, v); \
+        break;                                               \
+    case ATOMICS_OP_ ## op_name | (2 << 3):                 \
+        a = jspal_ ## func_name ## _32((uint32_t *)ptr, v); \
+        break;                                               \
+    case ATOMICS_OP_ ## op_name | (3 << 3):                 \
+        a = jspal_ ## func_name ## _64((uint64_t *)ptr, v); \
         break;
 
         OP(ADD, atomic_fetch_add)
@@ -60657,43 +60646,43 @@ static JSValue js_atomics_op(JSContext *ctx,
 #undef OP
 
     case ATOMICS_OP_LOAD | (0 << 3):
-        a = atomic_load((_Atomic(uint8_t) *)ptr);
+        a = jspal_atomic_load_8((uint8_t *)ptr);
         break;
     case ATOMICS_OP_LOAD | (1 << 3):
-        a = atomic_load((_Atomic(uint16_t) *)ptr);
+        a = jspal_atomic_load_16((uint16_t *)ptr);
         break;
     case ATOMICS_OP_LOAD | (2 << 3):
-        a = atomic_load((_Atomic(uint32_t) *)ptr);
+        a = jspal_atomic_load_32((uint32_t *)ptr);
         break;
     case ATOMICS_OP_LOAD | (3 << 3):
-        a = atomic_load((_Atomic(uint64_t) *)ptr);
+        a = jspal_atomic_load_64((uint64_t *)ptr);
         break;
 
     case ATOMICS_OP_COMPARE_EXCHANGE | (0 << 3):
         {
             uint8_t v1 = v;
-            atomic_compare_exchange_strong((_Atomic(uint8_t) *)ptr, &v1, rep_val);
+            jspal_atomic_compare_exchange_8((uint8_t *)ptr, &v1, rep_val);
             a = v1;
         }
         break;
     case ATOMICS_OP_COMPARE_EXCHANGE | (1 << 3):
         {
             uint16_t v1 = v;
-            atomic_compare_exchange_strong((_Atomic(uint16_t) *)ptr, &v1, rep_val);
+            jspal_atomic_compare_exchange_16((uint16_t *)ptr, &v1, rep_val);
             a = v1;
         }
         break;
     case ATOMICS_OP_COMPARE_EXCHANGE | (2 << 3):
         {
             uint32_t v1 = v;
-            atomic_compare_exchange_strong((_Atomic(uint32_t) *)ptr, &v1, rep_val);
+            jspal_atomic_compare_exchange_32((uint32_t *)ptr, &v1, rep_val);
             a = v1;
         }
         break;
     case ATOMICS_OP_COMPARE_EXCHANGE | (3 << 3):
         {
             uint64_t v1 = v;
-            atomic_compare_exchange_strong((_Atomic(uint64_t) *)ptr, &v1, rep_val);
+            jspal_atomic_compare_exchange_64((uint64_t *)ptr, &v1, rep_val);
             a = v1;
         }
         break;
@@ -60777,16 +60766,16 @@ static JSValue js_atomics_store(JSContext *ctx,
     
     switch(size_log2) {
     case 0:
-        atomic_store((_Atomic(uint8_t) *)ptr, v);
+        jspal_atomic_store_8((uint8_t *)ptr, v);
         break;
     case 1:
-        atomic_store((_Atomic(uint16_t) *)ptr, v);
+        jspal_atomic_store_16((uint16_t *)ptr, v);
         break;
     case 2:
-        atomic_store((_Atomic(uint32_t) *)ptr, v);
+        jspal_atomic_store_32((uint32_t *)ptr, v);
         break;
     case 3:
-        atomic_store((_Atomic(uint64_t) *)ptr, v);
+        jspal_atomic_store_64((uint64_t *)ptr, v);
         break;
     default:
         abort();
@@ -60812,7 +60801,8 @@ typedef struct JSAtomicsWaiter {
     int32_t *ptr;
 } JSAtomicsWaiter;
 
-static pthread_mutex_t js_atomics_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t js_atomics_mutex;
+static uint32_t js_atomics_mutex_state;
 static struct list_head js_atomics_waiter_list =
     LIST_HEAD_INIT(js_atomics_waiter_list);
 
@@ -60869,10 +60859,11 @@ static JSValue js_atomics_wait(JSContext *ctx,
     uint64_t idx;
     void *ptr;
     int64_t timeout;
-    struct timespec ts;
+    JSPalTime ts;
     JSAtomicsWaiter waiter_s, *waiter;
     int ret, size_log2, res;
     double d;
+    JSPal *pal = ctx->rt->pal;
 
     p = js_atomics_get_buf(ctx, argv[0], argv[1], &idx, 2);
     if (!p)
@@ -60904,6 +60895,7 @@ static JSValue js_atomics_wait(JSContext *ctx,
     /* XXX: inefficient if large number of waiters, should hash on
        'ptr' value */
     /* XXX: use Linux futexes when available ? */
+    js_pal_mutex_lazy_init(pal, &js_atomics_mutex, &js_atomics_mutex_state);
     pthread_mutex_lock(&js_atomics_mutex);
     if (size_log2 == 3) {
         res = *(int64_t *)ptr != v;
@@ -60926,11 +60918,11 @@ static JSValue js_atomics_wait(JSContext *ctx,
         ret = 0;
     } else {
         /* XXX: use clock monotonic */
-        clock_gettime(CLOCK_REALTIME, &ts);
+        jspal_get_time(pal, &ts);
         ts.tv_sec += timeout / 1000;
-        ts.tv_nsec += (timeout % 1000) * 1000000;
-        if (ts.tv_nsec >= 1000000000) {
-            ts.tv_nsec -= 1000000000;
+        ts.tv_usec += (timeout % 1000) * 1000;
+        if (ts.tv_usec >= 1000000) {
+            ts.tv_usec -= 1000000;
             ts.tv_sec++;
         }
         ret = pthread_cond_timedwait(&waiter->cond, &js_atomics_mutex,
@@ -60940,7 +60932,7 @@ static JSValue js_atomics_wait(JSContext *ctx,
         list_del(&waiter->link);
     pthread_mutex_unlock(&js_atomics_mutex);
     pthread_cond_destroy(&waiter->cond);
-    if (ret == ETIMEDOUT) {
+    if (ret != 0) {
         return JS_AtomToString(ctx, JS_ATOM_timed_out);
     } else {
         return JS_AtomToString(ctx, JS_ATOM_ok);
@@ -60959,6 +60951,7 @@ static JSValue js_atomics_notify(JSContext *ctx,
     JSAtomicsWaiter *waiter;
     JSArrayBuffer *abuf;
     JSObject *p;
+    JSPal *pal = ctx->rt->pal;
     
     p = js_atomics_get_buf(ctx, argv[0], argv[1], &idx, 1);
     if (!p)
@@ -60977,6 +60970,7 @@ static JSValue js_atomics_notify(JSContext *ctx,
     if (abuf->shared && count > 0) {
         /* 'argv[0]' is a SharedArrayBuffer so it cannot be detached nor reduced */
         ptr = p->u.array.u.uint8_ptr + ((uintptr_t)idx << size_log2);
+        js_pal_mutex_lazy_init(pal, &js_atomics_mutex, &js_atomics_mutex_state);
         pthread_mutex_lock(&js_atomics_mutex);
         init_list_head(&waiter_list);
         list_for_each_safe(el, el1, &js_atomics_waiter_list) {
