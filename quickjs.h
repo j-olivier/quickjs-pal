@@ -677,6 +677,18 @@ JSValue __js_printf_like(2, 3) JS_ThrowRangeError(JSContext *ctx, const char *fm
 JSValue __js_printf_like(2, 3) JS_ThrowInternalError(JSContext *ctx, const char *fmt, ...);
 JSValue JS_ThrowOutOfMemory(JSContext *ctx);
 
+/* Fatal error: like JS_ThrowInternalError(), but the exception cannot be caught by a
+   script try/catch. Replaces abort(): the host reads the code and message via the getters. */
+enum {
+    JS_FATAL_ERROR_NONE     = 0,
+    JS_FATAL_ERROR_INTERNAL = 1,
+};
+JSValue __js_printf_like(3, 4) JS_ThrowFatalError(JSContext *ctx, int32_t code, const char *fmt, ...);
+void __js_printf_like(3, 4) JS_ThrowFatalErrorRT(JSRuntime *rt, int32_t code, const char *fmt, ...);
+JS_BOOL JS_HasFatalError(JSRuntime *rt);
+int32_t JS_GetFatalErrorCode(JSRuntime *rt);
+const char *JS_GetFatalErrorMessage(JSRuntime *rt);
+
 void __JS_FreeValue(JSContext *ctx, JSValue v);
 
 static inline JSRefCountHeader *__js_rc(void *ptr)

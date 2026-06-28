@@ -528,6 +528,8 @@ int main(int argc, char **argv)
             js_std_eval_binary(ctx, qjsc_repl, qjsc_repl_size, 0);
         }
         js_std_loop(ctx);
+        if (JS_HasFatalError(rt))
+            goto fail;
     }
 
     if (dump_memory) {
@@ -565,8 +567,9 @@ int main(int argc, char **argv)
     }
     return 0;
  fail:
+    code = JS_HasFatalError(rt) ? JS_GetFatalErrorCode(rt) : 1;
     js_std_free_handlers(rt);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
-    return 1;
+    return code;
 }

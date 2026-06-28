@@ -845,6 +845,47 @@ must be explicitly tested and handled by the C code. The specific
 occurred. The actual exception object is stored in the
 @code{JSContext} and can be retrieved with @code{JS_GetException()}.
 
+@subsection Fatal errors
+
+When the engine hits an unrecoverable internal condition it used to call
+@code{abort()}, which terminates the whole process. Instead it now
+reports a @dfn{fatal error}: the host stays in control and decides what
+to do.
+
+@example
+JSValue JS_ThrowFatalError(JSContext *ctx, int32_t code,
+                           const char *fmt, ...);
+void JS_ThrowFatalErrorRT(JSRuntime *rt, int32_t code,
+                          const char *fmt, ...);
+@end example
+
+@code{JS_ThrowFatalError()} records the error and throws it as an
+@code{InternalError} that a script @code{try}/@code{catch} cannot catch,
+so the failure always propagates back out to the host.
+@code{JS_ThrowFatalErrorRT()} only records the error; it is used deep in
+the engine where no @code{JSContext} is available (for example during
+garbage collection). @code{code} is one of:
+
+@example
+enum @{
+    JS_FATAL_ERROR_NONE     = 0,
+    JS_FATAL_ERROR_INTERNAL = 1,
+@};
+@end example
+
+The host reads the error back with these getters:
+
+@example
+JS_BOOL     JS_HasFatalError(JSRuntime *rt);
+int32_t     JS_GetFatalErrorCode(JSRuntime *rt);
+const char *JS_GetFatalErrorMessage(JSRuntime *rt);
+@end example
+
+@code{JS_HasFatalError()} tells whether a fatal error was raised;
+@code{JS_GetFatalErrorCode()} returns its code and
+@code{JS_GetFatalErrorMessage()} its message. The message points to
+storage inside the runtime and stays valid until the runtime is freed.
+
 @subsection Script evaluation
 
 Use @code{JS_Eval()} to evaluate a script or module source.

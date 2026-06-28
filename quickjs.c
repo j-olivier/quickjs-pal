@@ -353,6 +353,11 @@ struct JSRuntime {
     /* true if inside an out of memory error, to avoid recursing */
     BOOL in_out_of_memory : 8;
 
+    /* set by JS_ThrowFatalError(); kept after JS_GetException() so the host can read it. */
+    BOOL fatal_error : 8;
+    int32_t fatal_error_code;
+    char fatal_error_msg[256]; /* fixed size: may be set when memory is low */
+
     struct JSStackFrame *current_stack_frame;
 
     JSInterruptHandler *interrupt_handler;
@@ -3142,7 +3147,8 @@ static JSAtomKindEnum JS_AtomGetKind(JSContext *ctx, JSAtom v)
         else
             return JS_ATOM_KIND_SYMBOL;
     default:
-        abort();
+        JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "JS_AtomGetKind: unhandled atom_type");
+        return JS_ATOM_KIND_STRING;
     }
 }
 
@@ -6419,7 +6425,8 @@ static void free_gc_object(JSRuntime *rt, JSGCObjectHeader *gp)
         js_free_module_def(rt, (JSModuleDef *)gp);
         break;
     default:
-        abort();
+        JS_ThrowFatalErrorRT(rt, JS_FATAL_ERROR_INTERNAL, "free_gc_object: unhandled gc_obj_type");
+        break;
     }
 }
 
@@ -6508,7 +6515,8 @@ void __JS_FreeValueRT(JSRuntime *rt, JSValue v)
         }
         break;
     default:
-        abort();
+        JS_ThrowFatalErrorRT(rt, JS_FATAL_ERROR_INTERNAL, "__JS_FreeValueRT: unhandled tag");
+        break;
     }
 }
 
@@ -6540,7 +6548,8 @@ static void gc_remove_weak_objects(JSRuntime *rt)
             finrec_delete_weakref(rt, wh);
             break;
         default:
-            abort();
+            JS_ThrowFatalErrorRT(rt, JS_FATAL_ERROR_INTERNAL, "gc_remove_weak_objects: unhandled weakref_type");
+            break;
         }
     }
 
@@ -6692,7 +6701,8 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
         }
         break;
     default:
-        abort();
+        JS_ThrowFatalErrorRT(rt, JS_FATAL_ERROR_INTERNAL, "mark_children: unhandled gc_obj_type");
+        break;
     }
 }
 
@@ -7871,6 +7881,52 @@ static void JS_ThrowInterrupted(JSContext *ctx)
 {
     JS_ThrowInternalError(ctx, "interrupted");
     JS_SetUncatchableException(ctx, TRUE);
+}
+
+static void js_fatal_error_record(JSRuntime *rt, int32_t code,
+                                  const char *fmt, va_list ap)
+{
+    vsnprintf(rt->fatal_error_msg, sizeof(rt->fatal_error_msg), fmt, ap);
+    rt->fatal_error = TRUE;
+    rt->fatal_error_code = code;
+}
+
+void JS_ThrowFatalErrorRT(JSRuntime *rt, int32_t code, const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    js_fatal_error_record(rt, code, fmt, ap);
+    va_end(ap);
+}
+
+JSValue JS_ThrowFatalError(JSContext *ctx, int32_t code, const char *fmt, ...)
+{
+    JSRuntime *rt = ctx->rt;
+    va_list ap;
+
+    va_start(ap, fmt);
+    js_fatal_error_record(rt, code, fmt, ap);
+    va_end(ap);
+    JS_ThrowInternalError(ctx, "%s", rt->fatal_error_msg);
+    /* a script try/catch must not catch a fatal engine error and keep running. */
+    JS_SetUncatchableException(ctx, TRUE);
+    return JS_EXCEPTION;
+}
+
+JS_BOOL JS_HasFatalError(JSRuntime *rt)
+{
+    return rt->fatal_error;
+}
+
+int32_t JS_GetFatalErrorCode(JSRuntime *rt)
+{
+    return rt->fatal_error_code;
+}
+
+const char *JS_GetFatalErrorMessage(JSRuntime *rt)
+{
+    return rt->fatal_error_msg;
 }
 
 static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
@@ -10671,8 +10727,11 @@ static int JS_DefineAutoInitProperty(JSContext *ctx, JSValueConst this_obj,
 
     if (find_own_property(&pr, p, prop)) {
         /* property already exists */
-        abort();
-        return FALSE;
+        char buf1[ATOM_GET_STR_BUF_SIZE];
+        JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL,
+                           "JS_DefineAutoInitProperty: property '%s' already exists",
+                           JS_AtomGetStr(ctx, buf1, sizeof(buf1), prop));
+        return -1;
     }
 
     /* Specialized CreateProperty */
@@ -12039,7 +12098,8 @@ static JSBigInt *js_bigint_logic(JSContext *ctx, const JSBigInt *a,
         }
         break;
     default:
-        abort();
+        JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_bigint_logic: unhandled op");
+        return NULL;
     }
     return js_bigint_normalize(ctx, r);
 }
@@ -12934,7 +12994,8 @@ static JSValue js_atof(JSContext *ctx, const char *str, const char **pp,
         }
         break;
     default:
-        abort();
+        val = JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_atof: unhandled atod_type");
+        goto done;
     }
 
 done:
@@ -13063,7 +13124,8 @@ static __exception int __JS_ToFloat64Free(JSContext *ctx, double *pres,
         d = JS_VALUE_GET_FLOAT64(val);
         break;
     default:
-        abort();
+        JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "__JS_ToFloat64Free: unhandled tag");
+        goto fail;
     }
     *pres = d;
     return 0;
@@ -14772,7 +14834,8 @@ static no_inline __exception int js_unary_arith_slow(JSContext *ctx,
                 }
                 break;
             default:
-                abort();
+                JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_unary_arith_slow: unhandled op (int)");
+                goto exception;
             }
             sp[-1] = JS_NewInt64(ctx, v64);
         }
@@ -14805,7 +14868,8 @@ static no_inline __exception int js_unary_arith_slow(JSContext *ctx,
                 sp[-1] = __JS_NewShortBigInt(ctx, -v);
                 break;
             default:
-                abort();
+                JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_unary_arith_slow: unhandled op (short bigint)");
+                goto exception;
             }
         }
         break;
@@ -14835,7 +14899,9 @@ static no_inline __exception int js_unary_arith_slow(JSContext *ctx,
                 r = js_bigint_not(ctx, p1);
                 break;
             default:
-                abort();
+                JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_unary_arith_slow: unhandled op (bigint)");
+                JS_FreeValue(ctx, op1);
+                goto exception;
             }
             JS_FreeValue(ctx, op1);
             if (!r)
@@ -14860,7 +14926,8 @@ static no_inline __exception int js_unary_arith_slow(JSContext *ctx,
                 d = -d;
                 break;
             default:
-                abort();
+                JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_unary_arith_slow: unhandled op (float64)");
+                goto exception;
             }
             sp[-1] = __JS_NewFloat64(ctx, d);
         }
@@ -14967,7 +15034,8 @@ static no_inline __exception int js_binary_arith_slow(JSContext *ctx, JSValue *s
         case OP_pow:
             goto slow_big_int;
         default:
-            abort();
+            JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_binary_arith_slow: unhandled op (short bigint)");
+            goto exception;
         }
         if (likely(v >= JS_SHORT_BIG_INT_MIN && v <= JS_SHORT_BIG_INT_MAX)) {
             sp[-2] = __JS_NewShortBigInt(ctx, v);
@@ -15023,7 +15091,8 @@ static no_inline __exception int js_binary_arith_slow(JSContext *ctx, JSValue *s
             sp[-2] = JS_NewFloat64(ctx, js_pow(v1, v2));
             return 0;
         default:
-            abort();
+            JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_binary_arith_slow: unhandled op (int)");
+            goto exception;
         }
         sp[-2] = JS_NewInt64(ctx, v);
     } else if ((tag1 == JS_TAG_SHORT_BIG_INT || tag1 == JS_TAG_BIG_INT) &&
@@ -15060,7 +15129,9 @@ static no_inline __exception int js_binary_arith_slow(JSContext *ctx, JSValue *s
             r = js_bigint_pow(ctx, p1, p2);
             break;
         default:
-            abort();
+            JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_binary_arith_slow: unhandled op (bigint)");
+            r = NULL;
+            break;
         }
         JS_FreeValue(ctx, op1);
         JS_FreeValue(ctx, op2);
@@ -15094,7 +15165,8 @@ static no_inline __exception int js_binary_arith_slow(JSContext *ctx, JSValue *s
             dr = js_pow(d1, d2);
             break;
         default:
-            abort();
+            JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_binary_arith_slow: unhandled op (float64)");
+            goto exception;
         }
         sp[-2] = __JS_NewFloat64(ctx, dr);
     }
@@ -15290,7 +15362,8 @@ static no_inline __exception int js_binary_logic_slow(JSContext *ctx,
             }
             break;
         default:
-            abort();
+            JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_binary_logic_slow: unhandled op (short bigint)");
+            goto exception;
         }
         sp[-2] = __JS_NewShortBigInt(ctx, v);
         return 0;
@@ -15345,7 +15418,9 @@ static no_inline __exception int js_binary_logic_slow(JSContext *ctx,
             }
             break;
         default:
-            abort();
+            JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_binary_logic_slow: unhandled op (bigint)");
+            r = NULL;
+            break;
         }
         JS_FreeValue(ctx, op1);
         JS_FreeValue(ctx, op2);
@@ -15376,7 +15451,8 @@ static no_inline __exception int js_binary_logic_slow(JSContext *ctx,
             r = v1 ^ v2;
             break;
         default:
-            abort();
+            JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_binary_logic_slow: unhandled op (int32)");
+            goto exception;
         }
         sp[-2] = JS_NewInt32(ctx, r);
     }
@@ -15404,7 +15480,8 @@ static JSBigInt *JS_ToBigIntBuf(JSContext *ctx, JSBigIntBuf *buf1,
         p1 = JS_VALUE_GET_PTR(op1);
         break;
     default:
-        abort();
+        JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "JS_ToBigIntBuf: unhandled tag");
+        return NULL;
     }
     return p1;
 }
@@ -15481,7 +15558,8 @@ static int js_compare_bigint(JSContext *ctx, OPCodeEnum op,
         res = val == 0;
         break;
     default:
-        abort();
+        JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_compare_bigint: unhandled op");
+        return FALSE;
     }
     return res;
 }
@@ -15579,6 +15657,8 @@ static no_inline int js_relational_slow(JSContext *ctx, JSValue *sp,
         if (tag1 == JS_TAG_BIG_INT || tag1 == JS_TAG_SHORT_BIG_INT ||
             tag2 == JS_TAG_BIG_INT || tag2 == JS_TAG_SHORT_BIG_INT) {
             res = js_compare_bigint(ctx, op, op1, op2);
+            if (JS_HasFatalError(ctx->rt))
+                goto exception;
         } else {
             double d1, d2;
 
@@ -15660,6 +15740,8 @@ static no_inline __exception int js_eq_slow(JSContext *ctx, JSValue *sp,
             res = (d1 == d2);
         } else {
             res = js_compare_bigint(ctx, OP_eq, op1, op2);
+            if (JS_HasFatalError(ctx->rt))
+                goto exception;
         }
     } else if (tag1 == tag2) {
         res = js_strict_eq2(ctx, op1, op2, JS_EQ_STRICT);
@@ -17345,7 +17427,9 @@ static JSValue js_closure2(JSContext *ctx, JSValue func_obj,
                 js_rc(var_ref)->ref_count++;
                 break;
             default:
-                abort();
+                JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_closure2: unhandled closure_type");
+                var_ref = NULL;
+                break;
             }
             if (!var_ref)
                 goto fail;
@@ -17702,7 +17786,8 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
         }
         break;
     default:
-        abort();
+        ret_val = JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_call_c_function: unhandled cproto");
+        break;
     }
 
     rt->current_stack_frame = sf->prev_frame;
@@ -18026,7 +18111,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto exception;
                     break;
                 default:
-                    abort();
+                    JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "OP_special_object: unhandled arg");
+                    goto exception;
                 }
             }
             BREAK;
@@ -21677,12 +21763,15 @@ static void js_async_generator_resume_next(JSContext *ctx,
                     }
                     goto done;
                 default:
-                    abort();
+                    JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_async_generator_resume_next: unhandled func_ret_code");
+                    JS_FreeValue(ctx, value);
+                    goto done;
                 }
             }
             break;
         default:
-            abort();
+            JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_async_generator_resume_next: unhandled state");
+            goto done;
         }
     }
  done: ;
@@ -24445,7 +24534,9 @@ static int define_var(JSParseState *s, JSFunctionDef *fd, JSAtom name,
         }
         break;
     default:
-        abort();
+        JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "define_var: unhandled var_def_type");
+        idx = -1;
+        break;
     }
     return idx;
 }
@@ -26052,7 +26143,8 @@ static __exception int get_lvalue(JSParseState *s, int *popcode, int *pscope,
             emit_op(s, OP_get_super_value);
             break;
         default:
-            abort();
+            JS_ThrowFatalError(s->ctx, JS_FATAL_ERROR_INTERNAL, "get_lvalue: unhandled opcode");
+            return -1;
         }
     } else {
         switch(opcode) {
@@ -26113,7 +26205,8 @@ static void put_lvalue(JSParseState *s, int opcode, int scope,
             emit_op(s, OP_dup);
             break;
         default:
-            abort();
+            JS_ThrowFatalError(s->ctx, JS_FATAL_ERROR_INTERNAL, "put_lvalue: unhandled special (depth 0)");
+            return;
         }
         break;
     case OP_get_field:
@@ -26133,7 +26226,8 @@ static void put_lvalue(JSParseState *s, int opcode, int scope,
             emit_op(s, OP_swap);
             break;
         default:
-            abort();
+            JS_ThrowFatalError(s->ctx, JS_FATAL_ERROR_INTERNAL, "put_lvalue: unhandled special (depth 1)");
+            return;
         }
         break;
     case OP_get_array_el:
@@ -26159,7 +26253,8 @@ static void put_lvalue(JSParseState *s, int opcode, int scope,
             emit_op(s, OP_rot3l);
             break;
         default:
-            abort();
+            JS_ThrowFatalError(s->ctx, JS_FATAL_ERROR_INTERNAL, "put_lvalue: unhandled special (depth 2)");
+            return;
         }
         break;
     case OP_get_super_value:
@@ -26178,7 +26273,8 @@ static void put_lvalue(JSParseState *s, int opcode, int scope,
             emit_op(s, OP_rot4l);
             break;
         default:
-            abort();
+            JS_ThrowFatalError(s->ctx, JS_FATAL_ERROR_INTERNAL, "put_lvalue: unhandled special (depth 3)");
+            return;
         }
         break;
     default:
@@ -26210,7 +26306,8 @@ static void put_lvalue(JSParseState *s, int opcode, int scope,
         emit_op(s, OP_put_super_value);
         break;
     default:
-        abort();
+        JS_ThrowFatalError(s->ctx, JS_FATAL_ERROR_INTERNAL, "put_lvalue: unhandled opcode");
+        return;
     }
 }
 
@@ -26262,7 +26359,8 @@ static __exception int js_define_var(JSParseState *s, JSAtom name, int tok)
         var_def_type = JS_VAR_DEF_CATCH;
         break;
     default:
-        abort();
+        JS_ThrowFatalError(s->ctx, JS_FATAL_ERROR_INTERNAL, "js_define_var: unhandled tok");
+        return -1;
     }
     if (define_var(s, fd, name, var_def_type) < 0)
         return -1;
@@ -26556,7 +26654,8 @@ static int js_parse_destructuring_element(JSParseState *s, int tok, int is_arg,
                             emit_op(s, OP_rot5l);
                             break;
                         default:
-                            abort();
+                            JS_ThrowFatalError(s->ctx, JS_FATAL_ERROR_INTERNAL, "js_parse_destructuring_element: unhandled depth_lvalue (computed prop)");
+                            goto prop_error;
                         }
                     } else {
                         switch(depth_lvalue) {
@@ -26575,7 +26674,8 @@ static int js_parse_destructuring_element(JSParseState *s, int tok, int is_arg,
                             emit_op(s, OP_rot4l);
                             break;
                         default:
-                            abort();
+                            JS_ThrowFatalError(s->ctx, JS_FATAL_ERROR_INTERNAL, "js_parse_destructuring_element: unhandled depth_lvalue");
+                            goto prop_error;
                         }
                     }
                 }
@@ -27650,7 +27750,8 @@ static __exception int js_parse_unary(JSParseState *s, int parse_flags)
             emit_op(s, OP_undefined);
             break;
         default:
-            abort();
+            JS_ThrowFatalError(s->ctx, JS_FATAL_ERROR_INTERNAL, "js_parse_unary: unhandled op");
+            return -1;
         }
         parse_flags = 0;
         break;
@@ -27906,7 +28007,8 @@ static __exception int js_parse_expr_binary(JSParseState *s, int level,
             }
             break;
         default:
-            abort();
+            JS_ThrowFatalError(s->ctx, JS_FATAL_ERROR_INTERNAL, "js_parse_expr_binary: unhandled level");
+            return -1;
         }
         if (next_token(s))
             return -1;
@@ -28280,7 +28382,8 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
             emit_op(s, OP_insert4);
             break;
         default:
-            abort();
+            JS_ThrowFatalError(s->ctx, JS_FATAL_ERROR_INTERNAL, "js_parse_assign_expr2: unhandled depth_lvalue");
+            return -1;
         }
 
         /* XXX: we disable the OP_put_ref_value optimization by not
@@ -33549,7 +33652,8 @@ static int resolve_scope_private_field(JSContext *ctx, JSFunctionDef *s,
             dbuf_putc(bc, JS_THROW_VAR_RO);
             break;
         default:
-            abort();
+            JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "resolve_scope_private_field: unhandled var_kind (get)");
+            return -1;
         }
         break;
     case OP_scope_put_private_field:
@@ -33592,7 +33696,8 @@ static int resolve_scope_private_field(JSContext *ctx, JSFunctionDef *s,
             }
             break;
         default:
-            abort();
+            JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "resolve_scope_private_field: unhandled var_kind (put)");
+            return -1;
         }
         break;
     case OP_scope_in_private_field:
@@ -33600,7 +33705,8 @@ static int resolve_scope_private_field(JSContext *ctx, JSFunctionDef *s,
         dbuf_putc(bc, OP_private_in);
         break;
     default:
-        abort();
+        JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "resolve_scope_private_field: unhandled op");
+        return -1;
     }
     return 0;
 }
@@ -33871,7 +33977,8 @@ static __exception int add_closure_variables(JSContext *ctx, JSFunctionDef *s,
         case JS_CLOSURE_GLOBAL:
             continue; /* not necessary to add global variables */
         default:
-            abort();
+            JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "add_closure_variables: unhandled closure_type");
+            return -1;
         }
         cv = &s->closure_var[s->closure_var_count++];
         cv->closure_type = JS_CLOSURE_REF;
@@ -34091,7 +34198,9 @@ static void instantiate_hoisted_definitions(JSContext *ctx, JSFunctionDef *s, Dy
                 goto closure_found;
             }
         }
-        abort();
+        JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "instantiate_hoisted_definitions: global var not found in closure");
+        dbuf_set_error(bc);
+        return;
     closure_found:
         if (hf->cpool_idx >= 0 || force_init) {
             if (hf->cpool_idx >= 0) {
@@ -39583,7 +39692,8 @@ static JSAtom find_atom(JSContext *ctx, const char *name)
             if (str->len == len && !memcmp(str->u.str8, name, len))
                 return JS_DupAtom(ctx, atom);
         }
-        abort();
+        JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "find_atom: symbol name not found");
+        return JS_ATOM_NULL;
     } else {
         atom = JS_NewAtom(ctx, name);
     }
@@ -39628,7 +39738,7 @@ static JSValue JS_InstantiateFunctionListItem2(JSContext *ctx, JSObject *p,
                                     e->u.prop_list.tab, e->u.prop_list.len);
         break;
     default:
-        abort();
+        return JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "JS_InstantiateFunctionListItem2: unhandled def_type");
     }
     return val;
 }
@@ -39655,7 +39765,9 @@ static int JS_InstantiateFunctionListItem(JSContext *ctx, JSValueConst obj,
                 val = JS_GetProperty(ctx, ctx->class_proto[JS_CLASS_ARRAY], atom1);
                 break;
             default:
-                abort();
+                JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "JS_InstantiateFunctionListItem: unhandled u.alias.base");
+                val = JS_EXCEPTION;
+                break;
             }
             JS_FreeAtom(ctx, atom1);
             if (JS_IsException(val))
@@ -39737,7 +39849,8 @@ static int JS_InstantiateFunctionListItem(JSContext *ctx, JSValueConst obj,
             return -1;
         return 0;
     default:
-        abort();
+        JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "JS_InstantiateFunctionListItem: unhandled def_type");
+        return -1;
     }
     if (JS_DefinePropertyValue(ctx, obj, atom, val, prop_flags) < 0)
         return -1;
@@ -39803,7 +39916,8 @@ int JS_SetModuleExportList(JSContext *ctx, JSModuleDef *m,
                                         e->u.prop_list.tab, e->u.prop_list.len);
             break;
         default:
-            abort();
+            JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "JS_SetModuleExportList: unhandled def_type");
+            return -1;
         }
         if (JS_SetModuleExport(ctx, m, e->name, val))
             return -1;
@@ -44147,8 +44261,8 @@ static JSValue js_create_iterator_helper(JSContext *ctx, JSValueConst this_val,
         }
         break;
     default:
-        abort();
-        break;
+        JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_create_iterator_helper: unhandled magic");
+        goto fail;
     }
 
     method = JS_GetProperty(ctx, this_val, JS_ATOM_next);
@@ -44322,8 +44436,8 @@ static JSValue js_iterator_proto_func(JSContext *ctx, JSValueConst this_val,
         }
         break;
     default:
-        abort();
-        break;
+        JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_iterator_proto_func: unhandled magic");
+        goto fail;
     }
 
     JS_FreeValue(ctx, func);
@@ -44739,7 +44853,8 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
         }
         break;
     default:
-        abort();
+        JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_iterator_helper_next: unhandled magic");
+        goto fail;
     }
 
  done:
@@ -57987,7 +58102,7 @@ static JSValue js_typed_array_fill(JSContext *ctx, JSValueConst this_val,
         }
         break;
     default:
-        abort();
+        return JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_typed_array_fill: unhandled shift");
     }
     return JS_DupValue(ctx, this_val);
 }
@@ -58481,7 +58596,7 @@ static JSValue js_typed_array_reverse(JSContext *ctx, JSValueConst this_val,
             }
             break;
         default:
-            abort();
+            return JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_typed_array_reverse: unhandled size_log2");
         }
     }
     return JS_DupValue(ctx, this_val);
@@ -58859,7 +58974,7 @@ static JSValue js_typed_array_sort(JSContext *ctx, JSValueConst this_val,
             cmpfun = js_TA_cmp_float64;
             break;
         default:
-            abort();
+            return JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_typed_array_sort: unhandled class_id");
         }
         elt_size = 1 << typed_array_size_log2(p->class_id);
         if (!JS_IsUndefined(tsc.cmp)) {
@@ -58922,7 +59037,10 @@ static JSValue js_typed_array_sort(JSContext *ctx, JSValueConst this_val,
                     }
                     break;
                 default:
-                    abort();
+                    JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_typed_array_sort: unhandled elt_size");
+                    js_free(ctx, array_idx);
+                    js_free(ctx, array);
+                    return JS_EXCEPTION;
                 }
             }
             js_free(ctx, array_idx);
@@ -60370,7 +60488,7 @@ static JSValue js_dataview_getValue(JSContext *ctx,
             return __JS_NewFloat64(ctx, u.f);
         }
     default:
-        abort();
+        return JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_dataview_getValue: unhandled class_id");
     }
 }
 
@@ -60464,7 +60582,7 @@ static JSValue js_dataview_setValue(JSContext *ctx,
         put_u64(ptr, v64);
         break;
     default:
-        abort();
+        return JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_dataview_setValue: unhandled class_id");
     }
     return JS_UNDEFINED;
 }
@@ -60687,7 +60805,7 @@ static JSValue js_atomics_op(JSContext *ctx,
         }
         break;
     default:
-        abort();
+        return JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_atomics_op: unhandled op/size_log2");
     }
 
     switch(p->class_id) {
@@ -60717,7 +60835,7 @@ static JSValue js_atomics_op(JSContext *ctx,
         ret = JS_NewBigUint64(ctx, a);
         break;
     default:
-        abort();
+        return JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_atomics_op: unhandled class_id");
     }
     return ret;
 }
@@ -60778,7 +60896,9 @@ static JSValue js_atomics_store(JSContext *ctx,
         jspal_atomic_store_64((uint64_t *)ptr, v);
         break;
     default:
-        abort();
+        JS_ThrowFatalError(ctx, JS_FATAL_ERROR_INTERNAL, "js_atomics_store: unhandled size_log2");
+        JS_FreeValue(ctx, ret);
+        return JS_EXCEPTION;
     }
     return ret;
 }
