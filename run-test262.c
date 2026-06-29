@@ -53,6 +53,10 @@
 
 #define CMD_NAME "run-test262"
 
+/* cap memory: some tests build a huge string to force an out-of-memory error.
+   without a cap this can take very long on 64-bit systems and slow the tests down. */
+#define TEST262_MEMORY_LIMIT ((size_t)256 << 20) /* 256 MiB */
+
 typedef struct namelist_t {
     char **array;
     int count;
@@ -606,6 +610,7 @@ static void *agent_start(void *arg)
     if (rt == NULL) {
         fatal(1, "JS_NewRuntime failure");
     }
+    JS_SetMemoryLimit(rt, TEST262_MEMORY_LIMIT);
     JS_SetRuntimeOpaque(rt, tls);
     ctx = JS_NewContext(rt);
     if (ctx == NULL) {
@@ -705,6 +710,7 @@ static void js_agent_free(JSContext *ctx)
     ThreadLocalStorage *tls = JS_GetRuntimeOpaque(JS_GetRuntime(ctx));
     struct list_head *el, *el1;
     Test262Agent *agent;
+    AgentReport *rep;
 
     list_for_each_safe(el, el1, &tls->agent_list) {
         agent = list_entry(el, Test262Agent, link);
@@ -712,6 +718,26 @@ static void js_agent_free(JSContext *ctx)
         JS_FreeValue(ctx, agent->broadcast_sab);
         list_del(&agent->link);
         free(agent);
+    }
+
+    /* tls->report_list is scoped to this worker thread, not to the test
+       file that just ran (it outlives this JSRuntime, unlike agent_list's
+       Test262Agent entries which are only ever touched while their owning
+       agent thread -- just joined above -- is alive). A test that throws
+       or asserts before calling $262.agent.getReport() as many times as
+       its agents called $262.agent.report() leaves reports here; without
+       draining them, the next unrelated test file run on this same thread
+       would silently consume this test's leftover report as its own
+       first getReport() result instead of the one it actually expects,
+       and if that next test's real report is what got shadowed, its own
+       $262.agent.getReport() retry loop (atomicsHelper.js) spins forever
+       sleeping 1ms at a time in jspal_cond_timedwait(), which looks like a
+       hang. */
+    list_for_each_safe(el, el1, &tls->report_list) {
+        rep = list_entry(el, AgentReport, link);
+        list_del(&rep->link);
+        free(rep->str);
+        free(rep);
     }
 }
 
@@ -1778,6 +1804,7 @@ int run_test_buf(ThreadLocalStorage *tls,
     if (rt == NULL) {
         fatal(1, "JS_NewRuntime failure");
     }
+    JS_SetMemoryLimit(rt, TEST262_MEMORY_LIMIT);
     JS_SetRuntimeOpaque(rt, tls);
     ctx = JS_NewContext(rt);
     if (ctx == NULL) {
@@ -2080,6 +2107,7 @@ int run_test262_harness_test(ThreadLocalStorage *tls,
     if (rt == NULL) {
         fatal(1, "JS_NewRuntime failure");
     }
+    JS_SetMemoryLimit(rt, TEST262_MEMORY_LIMIT);
     JS_SetRuntimeOpaque(rt, tls);
     ctx = JS_NewContext(rt);
     if (ctx == NULL) {
