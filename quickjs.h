@@ -751,6 +751,9 @@ int JS_ToFloat64(JSContext *ctx, double *pres, JSValueConst val);
 int JS_ToBigInt64(JSContext *ctx, int64_t *pres, JSValueConst val);
 /* same as JS_ToInt64() but allow BigInt */
 int JS_ToInt64Ext(JSContext *ctx, int64_t *pres, JSValueConst val);
+JSValue JS_NewBigInt128(JSContext *ctx, uint64_t low, uint64_t high);
+int JS_ToBigInt128(JSContext *ctx, uint64_t *plow, uint64_t *phigh, JSValueConst val);
+int JS_ToBigInt128Sat(JSContext *ctx, uint64_t *plow, uint64_t *phigh, JSValueConst val);
 
 JSValue JS_NewStringLen(JSContext *ctx, const char *str1, size_t len1);
 static inline JSValue JS_NewString(JSContext *ctx, const char *str)
@@ -770,6 +773,8 @@ static inline const char *JS_ToCString(JSContext *ctx, JSValueConst val1)
     return JS_ToCStringLen2(ctx, NULL, val1, 0);
 }
 void JS_FreeCString(JSContext *ctx, const char *ptr);
+
+JSValue JS_NewSymbol(JSContext *ctx, const char *description, JS_BOOL is_global);
 
 JSValue JS_NewObjectProtoClass(JSContext *ctx, JSValueConst proto, JSClassID class_id);
 JSValue JS_NewObjectClass(JSContext *ctx, int class_id);
