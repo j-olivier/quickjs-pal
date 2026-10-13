@@ -176,6 +176,12 @@
       <ObjectFileName>$(IntDir)temporal\</ObjectFileName>
     </ClCompile>
   </ItemGroup>
+  <ItemGroup Condition="'$(Platform)'=='x64'">
+    <ClInclude Include="intl\intl_private.h" />
+    <ClInclude Include="temporal\calendar.h" />
+    <ClInclude Include="temporal\temporal_private.h" />
+    <ClInclude Include="temporal\timezone.h" />
+  </ItemGroup>
   <ItemGroup>
     <ClInclude Include="quickjs-pal-overrides.h" />
     <ClInclude Include="quickjs.h" />
