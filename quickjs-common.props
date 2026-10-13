@@ -26,6 +26,12 @@
       <AdditionalLibraryDirectories>$(ClangRtWindowsLibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
+  <!-- Temporal/Intl needs 128-bit integers: disabled on 32-bit, like CONFIG_M32 in the Makefile -->
+  <ItemDefinitionGroup Condition="'$(Platform)'=='x64'">
+    <ClCompile>
+      <PreprocessorDefinitions>CONFIG_TEMPORAL_INTL;strcasecmp=_stricmp;strncasecmp=_strnicmp;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
     <ClCompile>
       <Optimization>Disabled</Optimization>
