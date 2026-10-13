@@ -45632,6 +45632,7 @@ static JSValue js_iterator_zip(JSContext *ctx, JSValueConst this_val,
 }
 
 typedef enum JSIteratorHelperKindEnum {
+    JS_ITERATOR_HELPER_KIND_CHUNKS,
     JS_ITERATOR_HELPER_KIND_DROP,
     JS_ITERATOR_HELPER_KIND_EVERY,
     JS_ITERATOR_HELPER_KIND_FILTER,
@@ -45641,6 +45642,7 @@ typedef enum JSIteratorHelperKindEnum {
     JS_ITERATOR_HELPER_KIND_MAP,
     JS_ITERATOR_HELPER_KIND_SOME,
     JS_ITERATOR_HELPER_KIND_TAKE,
+    JS_ITERATOR_HELPER_KIND_WINDOWS,
 } JSIteratorHelperKindEnum;
 
 typedef struct JSIteratorHelperData {
@@ -45649,10 +45651,14 @@ typedef struct JSIteratorHelperData {
     JSValue func; // predicate (filter) or mapper (flatMap, map)
     JSValue inner; // innerValue (flatMap)
     JSValue inner_next; // innerValue next method (flatMap)
+    JSValue *buf; // buffered values (chunks, windows)
     int64_t count; // limit (drop, take) or counter (filter, map, flatMap)
+    int buf_count; // number of values in |buf|
+    int buf_size; // allocated size of |buf|
     JSIteratorHelperKindEnum kind : 8;
     uint8_t executing : 1;
     uint8_t done : 1;
+    uint8_t allow_partial : 1; // yield a partial final window (windows)
 } JSIteratorHelperData;
 
 static JSValue js_create_iterator_helper(JSContext *ctx, JSValueConst this_val,
@@ -45662,13 +45668,55 @@ static JSValue js_create_iterator_helper(JSContext *ctx, JSValueConst this_val,
     JSValue obj, method;
     int64_t count;
     JSIteratorHelperData *it;
+    BOOL allow_partial;
 
     if (!JS_IsObject(this_val))
         return JS_ThrowTypeErrorNotAnObject(ctx);
     func = JS_UNDEFINED;
     count = 0;
+    allow_partial = FALSE;
 
     switch(magic) {
+    case JS_ITERATOR_HELPER_KIND_CHUNKS:
+    case JS_ITERATOR_HELPER_KIND_WINDOWS:
+        {
+            const char *name;
+            double d;
+            BOOL ok;
+
+            name = magic == JS_ITERATOR_HELPER_KIND_CHUNKS ? "chunkSize"
+                                                           : "windowSize";
+            // note: no coercion, the argument must be an integral number
+            d = NAN;
+            if (JS_IsNumber(argv[0]) && JS_ToFloat64(ctx, &d, argv[0]))
+                goto fail;
+            if (!isfinite(d) || trunc(d) != d) {
+                JS_ThrowTypeError(ctx, "%s is not an integral number", name);
+                goto fail;
+            }
+            if (d < 1 || d > UINT32_MAX) {
+                JS_ThrowRangeError(ctx, "%s out of range", name);
+                goto fail;
+            }
+            count = (int64_t)d;
+            if (magic == JS_ITERATOR_HELPER_KIND_WINDOWS && argc > 1 &&
+                !JS_IsUndefined(argv[1])) {
+                ok = FALSE;
+                if (JS_IsString(argv[1])) {
+                    const char *str = JS_ToCString(ctx, argv[1]);
+                    if (!str)
+                        goto fail;
+                    allow_partial = !strcmp(str, "allow-partial");
+                    ok = allow_partial || !strcmp(str, "only-full");
+                    JS_FreeCString(ctx, str);
+                }
+                if (!ok) {
+                    JS_ThrowTypeError(ctx, "bad undersized option");
+                    goto fail;
+                }
+            }
+        }
+        break;
     case JS_ITERATOR_HELPER_KIND_DROP:
     case JS_ITERATOR_HELPER_KIND_TAKE:
         {
@@ -45721,9 +45769,13 @@ static JSValue js_create_iterator_helper(JSContext *ctx, JSValueConst this_val,
     it->next = method;
     it->inner = JS_UNDEFINED;
     it->inner_next = JS_UNDEFINED;
+    it->buf = NULL;
     it->count = count;
+    it->buf_count = 0;
+    it->buf_size = 0;
     it->executing = 0;
     it->done = 0;
+    it->allow_partial = allow_partial;
     JS_SetOpaque(obj, it);
     return obj;
 range_error:
@@ -45888,6 +45940,71 @@ static JSValue js_iterator_proto_func(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
+static JSValue js_iterator_proto_includes(JSContext *ctx, JSValueConst this_val,
+                                          int argc, JSValueConst *argv)
+{
+    JSValue item, method;
+    int64_t to_skip, skipped;
+    double d;
+    int done;
+
+    if (!JS_IsObject(this_val))
+        return JS_ThrowTypeErrorNotAnObject(ctx);
+
+    // skippedElements is deliberately not coerced: anything that isn't an
+    // integral Number (or +/-Infinity) is a TypeError, and the underlying
+    // iterator is closed before the error propagates.
+    to_skip = 0;
+    if (argc > 1 && !JS_IsUndefined(argv[1])) {
+        if (!JS_IsNumber(argv[1])) {
+            JS_ThrowTypeError(ctx, "not a number");
+            goto fail;
+        }
+        JS_ToFloat64(ctx, &d, argv[1]); // cannot fail
+        if (isnan(d) || (isfinite(d) && trunc(d) != d)) {
+            JS_ThrowTypeError(ctx, "not an integral number");
+            goto fail;
+        }
+        if (d < 0 || (isfinite(d) && d > MAX_SAFE_INTEGER)) {
+            JS_ThrowRangeError(ctx, "must be positive");
+            goto fail;
+        }
+        // +Infinity means "skip everything"; use MAX_SAFE_INTEGER
+        to_skip = isfinite(d) ? (int64_t)d : MAX_SAFE_INTEGER;
+    }
+
+    // Note: a failure here propagates without closing the iterator.
+    method = JS_GetProperty(ctx, this_val, JS_ATOM_next);
+    if (JS_IsException(method))
+        return JS_EXCEPTION;
+
+    for (skipped = 0; /*empty*/; /*empty*/) {
+        item = JS_IteratorNext(ctx, this_val, method, &done);
+        if (JS_IsException(item)) {
+            // IteratorStepValue marks the iterator done, it does not close it.
+            JS_FreeValue(ctx, method);
+            return JS_EXCEPTION;
+        }
+        if (done) {
+            JS_FreeValue(ctx, method);
+            return JS_FALSE;
+        }
+        if (skipped < to_skip) {
+            skipped++;
+        } else if (js_same_value_zero(ctx, item, argv[0])) {
+            JS_FreeValue(ctx, item);
+            JS_FreeValue(ctx, method);
+            if (JS_IteratorClose(ctx, this_val, FALSE) < 0)
+                return JS_EXCEPTION;
+            return JS_TRUE;
+        }
+        JS_FreeValue(ctx, item);
+    }
+fail:
+    JS_IteratorClose(ctx, this_val, TRUE);
+    return JS_EXCEPTION;
+}
+
 static JSValue js_iterator_proto_reduce(JSContext *ctx, JSValueConst this_val,
                                         int argc, JSValueConst *argv)
 {
@@ -45989,6 +46106,69 @@ exception:
     return JS_EXCEPTION;
 }
 
+static JSValue js_iterator_proto_join(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv)
+{
+    JSValue item, method, sep = JS_UNDEFINED;
+    StringBuffer b_s, *b = &b_s;
+    JSString *p = NULL;
+    BOOL first;
+    int c, done;
+
+    if (!JS_IsObject(this_val))
+        return JS_ThrowTypeErrorNotAnObject(ctx);
+    c = ',';    /* default separator */
+    if (!JS_IsUndefined(argv[0])) {
+        sep = JS_ToString(ctx, argv[0]);
+        if (JS_IsException(sep)) {
+            JS_IteratorClose(ctx, this_val, /*is_exception_pending*/TRUE);
+            return JS_EXCEPTION;
+        }
+        p = JS_VALUE_GET_STRING(sep);
+        if (p->len == 1 && !p->is_wide_char)
+            c = p->u.str8[0];
+        else
+            c = -1;
+    }
+    method = JS_GetProperty(ctx, this_val, JS_ATOM_next);
+    if (JS_IsException(method)) {
+        JS_FreeValue(ctx, sep);
+        return JS_EXCEPTION;
+    }
+    string_buffer_init(ctx, b, 0);
+    for (first = TRUE; /*empty*/; first = FALSE) {
+        item = JS_IteratorNext(ctx, this_val, method, &done);
+        if (JS_IsException(item))
+            goto fail;
+        if (done)
+            break;
+        if (!first) {
+            if (c >= 0)
+                string_buffer_putc8(b, c);
+            else
+                string_buffer_concat(b, p, 0, p->len);
+        }
+        /* nullish values contribute the empty string */
+        if (JS_IsNull(item) || JS_IsUndefined(item)) {
+            JS_FreeValue(ctx, item);
+            continue;
+        }
+        if (string_buffer_concat_value_free(b, item))
+            goto close;
+    }
+    JS_FreeValue(ctx, method);
+    JS_FreeValue(ctx, sep);
+    return string_buffer_end(b);
+
+close:
+    JS_IteratorClose(ctx, this_val, /*is_exception_pending*/TRUE);
+fail:
+    string_buffer_free(b);
+    JS_FreeValue(ctx, method);
+    JS_FreeValue(ctx, sep);
+    return JS_EXCEPTION;
+}
+
 static JSValue js_iterator_proto_iterator(JSContext *ctx, JSValueConst this_val,
                                           int argc, JSValueConst *argv)
 {
@@ -46033,6 +46213,9 @@ static void js_iterator_helper_finalizer(JSRuntime *rt, JSValue val)
         JS_FreeValueRT(rt, it->next);
         JS_FreeValueRT(rt, it->inner);
         JS_FreeValueRT(rt, it->inner_next);
+        while (it->buf_count > 0)
+            JS_FreeValueRT(rt, it->buf[--it->buf_count]);
+        js_free_rt(rt, it->buf);
         js_free_rt(rt, it);
     }
 }
@@ -46048,6 +46231,8 @@ static void js_iterator_helper_mark(JSRuntime *rt, JSValueConst val,
         JS_MarkValue(rt, it->next, mark_func);
         JS_MarkValue(rt, it->inner, mark_func);
         JS_MarkValue(rt, it->inner_next, mark_func);
+        for (int i = 0; i < it->buf_count; i++)
+            JS_MarkValue(rt, it->buf[i], mark_func);
     }
 }
 
@@ -46093,10 +46278,70 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
         }
         if (JS_IteratorClose(ctx, it->obj, JS_IsException(ret)))
             ret = JS_EXCEPTION;
+        it->done = TRUE;
         goto done;
     }
 
     switch (it->kind) {
+    case JS_ITERATOR_HELPER_KIND_CHUNKS:
+    case JS_ITERATOR_HELPER_KIND_WINDOWS:
+        {
+            BOOL windows = it->kind == JS_ITERATOR_HELPER_KIND_WINDOWS;
+            JSValue item;
+
+            for (;;) {
+                item = JS_IteratorNext(ctx, it->obj, it->next, pdone);
+                if (JS_IsException(item))
+                    goto fail_no_close;
+                if (*pdone) {
+                    JS_FreeValue(ctx, item);
+                    /* the underlying iterator is done: yield what's left in
+                       the buffer, if anything, then stop */
+                    it->done = TRUE;
+                    ret = JS_UNDEFINED;
+                    if (it->buf_count < 1)
+                        break;
+                    if (windows) {
+                        /* a full window was already yielded */
+                        if (!it->allow_partial || it->buf_count >= it->count)
+                            break;
+                        ret = js_create_array(ctx, it->buf_count, (JSValueConst *)it->buf);
+                    } else {
+                        ret = js_create_array_free(ctx, it->buf_count, it->buf);
+                        it->buf_count = 0; // ownership transferred
+                    }
+                    if (JS_IsException(ret))
+                        goto fail_no_close;
+                    *pdone = FALSE;
+                    goto done;
+                }
+                if (windows && it->buf_count == it->count) {
+                    /* slide the window */
+                    JS_FreeValue(ctx, it->buf[0]);
+                    it->buf_count--;
+                    memmove(it->buf, &it->buf[1],
+                            it->buf_count * sizeof(*it->buf));
+                }
+                if (js_resize_array(ctx, (void **)&it->buf, sizeof(*it->buf),
+                                    &it->buf_size, it->buf_count + 1)) {
+                    JS_FreeValue(ctx, item);
+                    goto fail_no_close;
+                }
+                it->buf[it->buf_count++] = item;
+                if (it->buf_count == it->count) {
+                    if (windows) {
+                        ret = js_create_array(ctx, it->buf_count, (JSValueConst *)it->buf);
+                    } else {
+                        ret = js_create_array_free(ctx, it->buf_count, it->buf);
+                        it->buf_count = 0; // ownership transferred
+                    }
+                    if (JS_IsException(ret))
+                        goto fail_no_close;
+                    break;
+                }
+            }
+        }
+        break;
     case JS_ITERATOR_HELPER_KIND_DROP:
         {
             JSValue item;
@@ -46108,7 +46353,7 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
                 JS_FreeValue(ctx, item);
                 if (*pdone) {
                     ret = JS_UNDEFINED;
-                    goto done;
+                    goto done_drop;
                 }
             }
 
@@ -46116,6 +46361,7 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
             if (JS_IsException(item))
                 goto fail_no_close;
             ret = item;
+        done_drop: ;
         }
         break;
     case JS_ITERATOR_HELPER_KIND_FILTER:
@@ -46208,7 +46454,7 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
                 goto fail_no_close;
             if (*pdone) {
                 ret = item;
-                goto done;
+                break;
             }
             index_val = JS_NewInt64(ctx, it->count++);
             args[0] = item;
@@ -46243,15 +46489,23 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
         goto fail;
     }
 
- done:
     it->done = *pdone;
+ done:
     it->executing = 0;
+    if (it->done && it->buf) {
+        while (it->buf_count > 0)
+            JS_FreeValue(ctx, it->buf[--it->buf_count]);
+        js_free(ctx, it->buf);
+        it->buf = NULL;
+        it->buf_size = 0;
+    }
     return ret;
  fail:
     /* close the iterator object, preserving pending exception */
     JS_IteratorClose(ctx, it->obj, TRUE);
  fail_no_close:
     ret = JS_EXCEPTION;
+    it->done = TRUE;
     goto done;
 }
 
@@ -46263,15 +46517,19 @@ static const JSCFunctionListEntry js_iterator_funcs[] = {
 };
 
 static const JSCFunctionListEntry js_iterator_proto_funcs[] = {
+    JS_CFUNC_MAGIC_DEF("chunks", 1, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_CHUNKS ),
     JS_CFUNC_MAGIC_DEF("drop", 1, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_DROP ),
     JS_CFUNC_MAGIC_DEF("filter", 1, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_FILTER ),
     JS_CFUNC_MAGIC_DEF("flatMap", 1, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_FLAT_MAP ),
     JS_CFUNC_MAGIC_DEF("map", 1, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_MAP ),
     JS_CFUNC_MAGIC_DEF("take", 1, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_TAKE ),
+    JS_CFUNC_MAGIC_DEF("windows", 1, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_WINDOWS ),
     JS_CFUNC_MAGIC_DEF("every", 1, js_iterator_proto_func, JS_ITERATOR_HELPER_KIND_EVERY ),
     JS_CFUNC_MAGIC_DEF("find", 1, js_iterator_proto_func, JS_ITERATOR_HELPER_KIND_FIND),
     JS_CFUNC_MAGIC_DEF("forEach", 1, js_iterator_proto_func, JS_ITERATOR_HELPER_KIND_FOR_EACH ),
     JS_CFUNC_MAGIC_DEF("some", 1, js_iterator_proto_func, JS_ITERATOR_HELPER_KIND_SOME ),
+    JS_CFUNC_DEF("includes", 1, js_iterator_proto_includes ),
+    JS_CFUNC_DEF("join", 1, js_iterator_proto_join ),
     JS_CFUNC_DEF("reduce", 1, js_iterator_proto_reduce ),
     JS_CFUNC_DEF("toArray", 0, js_iterator_proto_toArray ),
     JS_CFUNC_DEF("[Symbol.iterator]", 0, js_iterator_proto_iterator ),
@@ -55778,6 +56036,321 @@ static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val,
     goto done;
 }
 
+/* Promise.allKeyed and Promise.allSettledKeyed ("await dictionary"
+   proposal).  magic = 0: Promise.allKeyed, magic = 1:
+   Promise.allSettledKeyed.  The element functions use the same magic
+   with PROMISE_KEYED_MAGIC_reject added for the rejection handlers of
+   Promise.allSettledKeyed. */
+
+#define PROMISE_KEYED_MAGIC_allSettled 1
+#define PROMISE_KEYED_MAGIC_reject  2
+
+/* CreateKeyedPromiseCombinatorResultObject: an ordinary object with a
+   null prototype holding the collected entries in key order.  'keys'
+   and 'values' are parallel arrays. */
+static JSValue promise_keyed_result_object(JSContext *ctx, JSValueConst keys,
+                                           JSValueConst values)
+{
+    JSValue obj, key, val;
+    uint32_t len, i;
+    JSAtom atom;
+    int res;
+
+    obj = JS_NewObjectProto(ctx, JS_NULL);
+    if (JS_IsException(obj))
+        return obj;
+    if (js_get_length32(ctx, &len, values) < 0)
+        goto fail;
+    for (i = 0; i < len; i++) {
+        key = JS_GetPropertyUint32(ctx, keys, i);
+        if (JS_IsException(key))
+            goto fail;
+        atom = JS_ValueToAtom(ctx, key);
+        JS_FreeValue(ctx, key);
+        if (atom == JS_ATOM_NULL)
+            goto fail;
+        val = JS_GetPropertyUint32(ctx, values, i);
+        if (JS_IsException(val)) {
+            JS_FreeAtom(ctx, atom);
+            goto fail;
+        }
+        res = JS_DefinePropertyValue(ctx, obj, atom, val,
+                                     JS_PROP_C_W_E | JS_PROP_THROW);
+        JS_FreeAtom(ctx, atom);
+        if (res < 0)
+            goto fail;
+    }
+    return obj;
+ fail:
+    JS_FreeValue(ctx, obj);
+    return JS_EXCEPTION;
+}
+
+/* func_data: [0] [[AlreadyCalled]] record, [1] index, [2] values,
+   [3] keys, [4] resolve function, [5] remainingElementsCount */
+static JSValue js_promise_allKeyed_resolve_element(JSContext *ctx,
+                                                   JSValueConst this_val,
+                                                   int argc, JSValueConst *argv,
+                                                   int magic, JSValue *func_data)
+{
+    JSValueConst called_box, value, values, keys, handler, env;
+    JSValue called, obj, ret, result;
+    BOOL alreadyCalled;
+    BOOL is_reject = (magic & PROMISE_KEYED_MAGIC_reject) != 0;
+    int index, is_zero;
+
+    /* func_data[0] holds the [[AlreadyCalled]] record which is shared
+       with the other handler of the same key */
+    called_box = func_data[0];
+    called = JS_GetPropertyUint32(ctx, called_box, 0);
+    if (JS_IsException(called))
+        return JS_EXCEPTION;
+    alreadyCalled = JS_ToBool(ctx, called);
+    JS_FreeValue(ctx, called);
+    if (alreadyCalled < 0)
+        return JS_EXCEPTION;
+    if (alreadyCalled)
+        return JS_UNDEFINED;
+    if (JS_SetPropertyUint32(ctx, called_box, 0, JS_TRUE) < 0)
+        return JS_EXCEPTION;
+    if (JS_ToInt32(ctx, &index, func_data[1]))
+        return JS_EXCEPTION;
+    value = (argc > 0) ? argv[0] : JS_UNDEFINED;
+    values = func_data[2];
+    keys = func_data[3];
+    handler = func_data[4];
+    env = func_data[5];
+
+    if (magic & PROMISE_KEYED_MAGIC_allSettled) {
+        JSValue str;
+
+        obj = JS_NewObject(ctx);
+        if (JS_IsException(obj))
+            return JS_EXCEPTION;
+        str = js_new_string8(ctx, is_reject ? "rejected" : "fulfilled");
+        if (JS_IsException(str))
+            goto fail_obj;
+        if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_status, str,
+                                   JS_PROP_C_W_E) < 0)
+            goto fail_obj;
+        if (JS_DefinePropertyValue(ctx, obj,
+                                   is_reject ? JS_ATOM_reason : JS_ATOM_value,
+                                   JS_DupValue(ctx, value),
+                                   JS_PROP_C_W_E) < 0)
+            goto fail_obj;
+    } else {
+        obj = JS_DupValue(ctx, value);
+    }
+    if (JS_DefinePropertyValueUint32(ctx, values, index, obj,
+                                     JS_PROP_C_W_E) < 0)
+        return JS_EXCEPTION;
+
+    is_zero = remainingElementsCount_add(ctx, env, -1);
+    if (is_zero < 0)
+        return JS_EXCEPTION;
+    if (is_zero) {
+        result = promise_keyed_result_object(ctx, keys, values);
+        if (JS_IsException(result))
+            return JS_EXCEPTION;
+        ret = JS_Call(ctx, handler, JS_UNDEFINED, 1, (JSValueConst *)&result);
+        JS_FreeValue(ctx, result);
+        if (JS_IsException(ret))
+            return ret;
+        JS_FreeValue(ctx, ret);
+    }
+    return JS_UNDEFINED;
+
+ fail_obj:
+    JS_FreeValue(ctx, obj);
+    return JS_EXCEPTION;
+}
+
+static JSValue js_promise_allKeyed(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv, int magic)
+{
+    JSValueConst promises = argv[0];
+    JSValue result_promise, resolving_funcs[2];
+    JSValue promise_resolve = JS_UNDEFINED;
+    JSValue keys = JS_UNDEFINED, values = JS_UNDEFINED, env = JS_UNDEFINED;
+    JSValue propertyValue, next_promise, ret, error;
+    JSValue resolve_element = JS_UNDEFINED, reject_element = JS_UNDEFINED;
+    JSValue called_box = JS_UNDEFINED;
+    JSValueConst then_args[2], data[6];
+    JSPropertyEnum *ptab = NULL;
+    JSPropertyDescriptor desc;
+    uint32_t plen = 0, i;
+    int index, is_zero, res;
+
+    if (!JS_IsObject(this_val))
+        return JS_ThrowTypeErrorNotAnObject(ctx);
+    result_promise = js_new_promise_capability(ctx, resolving_funcs, this_val);
+    if (JS_IsException(result_promise))
+        return result_promise;
+
+    promise_resolve = JS_GetProperty(ctx, this_val, JS_ATOM_resolve);
+    if (JS_IsException(promise_resolve) ||
+        check_function(ctx, promise_resolve))
+        goto fail_reject;
+    if (!JS_IsObject(promises)) {
+        JS_ThrowTypeErrorNotAnObject(ctx);
+        goto fail_reject;
+    }
+    keys = JS_NewArray(ctx);
+    if (JS_IsException(keys))
+        goto fail_reject;
+    values = JS_NewArray(ctx);
+    if (JS_IsException(values))
+        goto fail_reject;
+    env = JS_NewArray(ctx);
+    if (JS_IsException(env))
+        goto fail_reject;
+    /* remainingElementsCount field */
+    if (JS_DefinePropertyValueUint32(ctx, env, 0, JS_NewInt32(ctx, 1),
+                                     JS_PROP_C_W_E) < 0)
+        goto fail_reject;
+
+    if (JS_GetOwnPropertyNames(ctx, &ptab, &plen, promises,
+                               JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK) < 0)
+        goto fail_reject;
+
+    index = 0;
+    for (i = 0; i < plen; i++) {
+        JSAtom key = ptab[i].atom;
+
+        memset(&desc, 0, sizeof(desc));
+        res = JS_GetOwnProperty(ctx, &desc, promises, key);
+        if (res < 0)
+            goto fail_reject;
+        if (res == 0 || !(desc.flags & JS_PROP_ENUMERABLE)) {
+            if (res > 0)
+                js_free_desc(ctx, &desc);
+            continue;
+        }
+        js_free_desc(ctx, &desc);
+
+        propertyValue = JS_GetProperty(ctx, promises, key);
+        if (JS_IsException(propertyValue))
+            goto fail_reject;
+        /* entries.append(Record { [[Key]]: key, [[Value]]: undefined }) */
+        ret = JS_AtomToValue(ctx, key);
+        if (JS_IsException(ret)) {
+            JS_FreeValue(ctx, propertyValue);
+            goto fail_reject;
+        }
+        if (JS_DefinePropertyValueUint32(ctx, keys, index, ret,
+                                         JS_PROP_C_W_E) < 0) {
+            JS_FreeValue(ctx, propertyValue);
+            goto fail_reject;
+        }
+        if (JS_DefinePropertyValueUint32(ctx, values, index, JS_UNDEFINED,
+                                         JS_PROP_C_W_E) < 0) {
+            JS_FreeValue(ctx, propertyValue);
+            goto fail_reject;
+        }
+
+        next_promise = JS_Call(ctx, promise_resolve, this_val, 1,
+                               (JSValueConst *)&propertyValue);
+        JS_FreeValue(ctx, propertyValue);
+        if (JS_IsException(next_promise))
+            goto fail_reject;
+
+        /* the [[AlreadyCalled]] record shared by both handlers */
+        called_box = JS_NewArray(ctx);
+        if (JS_IsException(called_box)) {
+            JS_FreeValue(ctx, next_promise);
+            goto fail_reject;
+        }
+        if (JS_DefinePropertyValueUint32(ctx, called_box, 0, JS_FALSE,
+                                         JS_PROP_C_W_E) < 0) {
+            JS_FreeValue(ctx, next_promise);
+            goto fail_reject;
+        }
+        data[0] = called_box;
+        data[1] = JS_NewInt32(ctx, index);
+        data[2] = values;
+        data[3] = keys;
+        data[4] = resolving_funcs[0];
+        data[5] = env;
+        resolve_element =
+            JS_NewCFunctionData(ctx, js_promise_allKeyed_resolve_element, 1,
+                                magic, 6, data);
+        if (JS_IsException(resolve_element)) {
+            JS_FreeValue(ctx, next_promise);
+            goto fail_reject;
+        }
+        if (magic & PROMISE_KEYED_MAGIC_allSettled) {
+            reject_element =
+                JS_NewCFunctionData(ctx, js_promise_allKeyed_resolve_element,
+                                    1, magic | PROMISE_KEYED_MAGIC_reject,
+                                    6, data);
+            if (JS_IsException(reject_element)) {
+                JS_FreeValue(ctx, resolve_element);
+                JS_FreeValue(ctx, next_promise);
+                goto fail_reject;
+            }
+        } else {
+            reject_element = JS_DupValue(ctx, resolving_funcs[1]);
+        }
+
+        JS_FreeValue(ctx, called_box);
+        called_box = JS_UNDEFINED;
+
+        if (remainingElementsCount_add(ctx, env, 1) < 0) {
+            JS_FreeValue(ctx, resolve_element);
+            JS_FreeValue(ctx, reject_element);
+            JS_FreeValue(ctx, next_promise);
+            goto fail_reject;
+        }
+
+        then_args[0] = resolve_element;
+        then_args[1] = reject_element;
+        ret = JS_InvokeFree(ctx, next_promise, JS_ATOM_then, 2, then_args);
+        JS_FreeValue(ctx, resolve_element);
+        JS_FreeValue(ctx, reject_element);
+        if (check_exception_free(ctx, ret))
+            goto fail_reject;
+        index++;
+    }
+
+    is_zero = remainingElementsCount_add(ctx, env, -1);
+    if (is_zero < 0)
+        goto fail_reject;
+    if (is_zero) {
+        ret = promise_keyed_result_object(ctx, keys, values);
+        if (JS_IsException(ret))
+            goto fail_reject;
+        error = JS_Call(ctx, resolving_funcs[0], JS_UNDEFINED, 1,
+                        (JSValueConst *)&ret);
+        JS_FreeValue(ctx, ret);
+        if (check_exception_free(ctx, error))
+            goto fail_reject;
+    }
+ done:
+    JS_FreeValue(ctx, called_box);
+    JS_FreePropertyEnum(ctx, ptab, plen);
+    JS_FreeValue(ctx, promise_resolve);
+    JS_FreeValue(ctx, env);
+    JS_FreeValue(ctx, values);
+    JS_FreeValue(ctx, keys);
+    JS_FreeValue(ctx, resolving_funcs[0]);
+    JS_FreeValue(ctx, resolving_funcs[1]);
+    return result_promise;
+
+ fail_reject:
+    error = JS_GetException(ctx);
+    ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1,
+                  (JSValueConst *)&error);
+    JS_FreeValue(ctx, error);
+    if (JS_IsException(ret))
+        goto fail;
+    JS_FreeValue(ctx, ret);
+    goto done;
+ fail:
+    JS_FreeValue(ctx, result_promise);
+    result_promise = JS_EXCEPTION;
+    goto done;
+}
+
 static JSValue js_promise_race(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv)
 {
@@ -56025,6 +56598,8 @@ static const JSCFunctionListEntry js_promise_funcs[] = {
     JS_CFUNC_MAGIC_DEF("reject", 1, js_promise_resolve, 1 ),
     JS_CFUNC_MAGIC_DEF("all", 1, js_promise_all, PROMISE_MAGIC_all ),
     JS_CFUNC_MAGIC_DEF("allSettled", 1, js_promise_all, PROMISE_MAGIC_allSettled ),
+    JS_CFUNC_MAGIC_DEF("allKeyed", 1, js_promise_allKeyed, 0 ),
+    JS_CFUNC_MAGIC_DEF("allSettledKeyed", 1, js_promise_allKeyed, PROMISE_KEYED_MAGIC_allSettled ),
     JS_CFUNC_MAGIC_DEF("any", 1, js_promise_all, PROMISE_MAGIC_any ),
     JS_CFUNC_DEF("try", 1, js_promise_try ),
     JS_CFUNC_DEF("race", 1, js_promise_race ),
