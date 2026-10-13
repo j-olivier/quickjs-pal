@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="intl">
+      <UniqueIdentifier>{7B1E6C0A-3F41-4C57-9A0D-5C3E2D8F1A01}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="temporal">
+      <UniqueIdentifier>{7B1E6C0A-3F41-4C57-9A0D-5C3E2D8F1A02}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="intl\collator.c">
+      <Filter>intl</Filter>
+    </ClCompile>
+    <ClCompile Include="intl\datetimeformat.c">
+      <Filter>intl</Filter>
+    </ClCompile>
+    <ClCompile Include="intl\displaynames.c">
+      <Filter>intl</Filter>
+    </ClCompile>
+    <ClCompile Include="intl\durationformat.c">
+      <Filter>intl</Filter>
+    </ClCompile>
+    <ClCompile Include="intl\intl.c">
+      <Filter>intl</Filter>
+    </ClCompile>
+    <ClCompile Include="intl\listformat.c">
+      <Filter>intl</Filter>
+    </ClCompile>
+    <ClCompile Include="intl\locale-data.c">
+      <Filter>intl</Filter>
+    </ClCompile>
+    <ClCompile Include="intl\locale.c">
+      <Filter>intl</Filter>
+    </ClCompile>
+    <ClCompile Include="intl\numberformat.c">
+      <Filter>intl</Filter>
+    </ClCompile>
+    <ClCompile Include="intl\pluralrules.c">
+      <Filter>intl</Filter>
+    </ClCompile>
+    <ClCompile Include="intl\relativetimeformat.c">
+      <Filter>intl</Filter>
+    </ClCompile>
+    <ClCompile Include="intl\segmenter.c">
+      <Filter>intl</Filter>
+    </ClCompile>
+    <ClCompile Include="temporal\calendar.c">
+      <Filter>temporal</Filter>
+    </ClCompile>
+    <ClCompile Include="temporal\duration.c">
+      <Filter>temporal</Filter>
+    </ClCompile>
+    <ClCompile Include="temporal\instant.c">
+      <Filter>temporal</Filter>
+    </ClCompile>
+    <ClCompile Include="temporal\now.c">
+      <Filter>temporal</Filter>
+    </ClCompile>
+    <ClCompile Include="temporal\plaindate.c">
+      <Filter>temporal</Filter>
+    </ClCompile>
+    <ClCompile Include="temporal\plaindatetime.c">
+      <Filter>temporal</Filter>
+    </ClCompile>
+    <ClCompile Include="temporal\plainmonthday.c">
+      <Filter>temporal</Filter>
+    </ClCompile>
+    <ClCompile Include="temporal\plaintime.c">
+      <Filter>temporal</Filter>
+    </ClCompile>
+    <ClCompile Include="temporal\plainyearmonth.c">
+      <Filter>temporal</Filter>
+    </ClCompile>
+    <ClCompile Include="temporal\temporal.c">
+      <Filter>temporal</Filter>
+    </ClCompile>
+    <ClCompile Include="temporal\timezone.c">
+      <Filter>temporal</Filter>
+    </ClCompile>
+    <ClCompile Include="temporal\tzdata_generated.c">
+      <Filter>temporal</Filter>
+    </ClCompile>
+    <ClCompile Include="temporal\zoneddatetime.c">
+      <Filter>temporal</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="intl\intl_private.h">
+      <Filter>intl</Filter>
+    </ClInclude>
+    <ClInclude Include="temporal\calendar.h">
+      <Filter>temporal</Filter>
+    </ClInclude>
+    <ClInclude Include="temporal\temporal_private.h">
+      <Filter>temporal</Filter>
+    </ClInclude>
+    <ClInclude Include="temporal\timezone.h">
+      <Filter>temporal</Filter>
+    </ClInclude>
+  </ItemGroup>
+</Project>
