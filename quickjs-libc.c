@@ -442,7 +442,7 @@ uint8_t *js_load_file(JSContext *ctx, size_t *pbuf_len, const char *filename)
     }
     buf[buf_len] = '\0';
     fclose(f);
-    *pbuf_len = buf_len;
+    if (pbuf_len) *pbuf_len = buf_len;
     return buf;
 }
 
