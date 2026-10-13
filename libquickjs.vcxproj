@@ -99,6 +99,83 @@
     <ClCompile Include="libunicode.c" />
     <ClCompile Include="cutils.c" />
   </ItemGroup>
+  <ItemGroup Condition="'$(Platform)'=='x64'">
+    <ClCompile Include="intl\intl.c">
+      <ObjectFileName>$(IntDir)intl\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="intl\locale.c">
+      <ObjectFileName>$(IntDir)intl\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="intl\locale-data.c">
+      <ObjectFileName>$(IntDir)intl\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="intl\numberformat.c">
+      <ObjectFileName>$(IntDir)intl\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="intl\collator.c">
+      <ObjectFileName>$(IntDir)intl\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="intl\datetimeformat.c">
+      <ObjectFileName>$(IntDir)intl\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="intl\pluralrules.c">
+      <ObjectFileName>$(IntDir)intl\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="intl\listformat.c">
+      <ObjectFileName>$(IntDir)intl\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="intl\relativetimeformat.c">
+      <ObjectFileName>$(IntDir)intl\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="intl\displaynames.c">
+      <ObjectFileName>$(IntDir)intl\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="intl\segmenter.c">
+      <ObjectFileName>$(IntDir)intl\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="intl\durationformat.c">
+      <ObjectFileName>$(IntDir)intl\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="temporal\temporal.c">
+      <ObjectFileName>$(IntDir)temporal\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="temporal\instant.c">
+      <ObjectFileName>$(IntDir)temporal\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="temporal\duration.c">
+      <ObjectFileName>$(IntDir)temporal\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="temporal\plaintime.c">
+      <ObjectFileName>$(IntDir)temporal\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="temporal\now.c">
+      <ObjectFileName>$(IntDir)temporal\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="temporal\plaindate.c">
+      <ObjectFileName>$(IntDir)temporal\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="temporal\plaindatetime.c">
+      <ObjectFileName>$(IntDir)temporal\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="temporal\plainyearmonth.c">
+      <ObjectFileName>$(IntDir)temporal\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="temporal\plainmonthday.c">
+      <ObjectFileName>$(IntDir)temporal\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="temporal\zoneddatetime.c">
+      <ObjectFileName>$(IntDir)temporal\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="temporal\calendar.c">
+      <ObjectFileName>$(IntDir)temporal\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="temporal\timezone.c">
+      <ObjectFileName>$(IntDir)temporal\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="temporal\tzdata_generated.c">
+      <ObjectFileName>$(IntDir)temporal\</ObjectFileName>
+    </ClCompile>
+  </ItemGroup>
   <ItemGroup>
     <ClInclude Include="quickjs-pal-overrides.h" />
     <ClInclude Include="quickjs.h" />
