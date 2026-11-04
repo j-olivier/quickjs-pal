@@ -97,6 +97,11 @@ function test_bigint1()
 
     r = 1n << 32n;
     assert(r, 4294967296n, "1 << 32n === 4294967296n");
+
+    assert(-0.5 < -1n, false);
+    assert(-1n > -0.5, false);
+    assert(-2147483648 < -1n, true);
+    assert(-1n < -2147483648, false);
 }
 
 function test_bigint2()
@@ -112,6 +117,7 @@ function test_bigint2()
 
 function test_bigint3()
 {
+    var x;
     assert(Number(0xffffffffffffffffn), 18446744073709552000);
     assert(Number(-0xffffffffffffffffn), -18446744073709552000);
     assert(100000000000000000000n == 1e20, true);
@@ -139,6 +145,8 @@ function test_bigint3()
     assert((2n) ** 127n, 170141183460469231731687303715884105728n);
     assert((-256n) ** 11n, -309485009821345068724781056n);
     assert((7n) ** 20n, 79792266297612001n);
+    x = 0x1ffffffffffffffffffffff01n;
+    assert(--x, 0x1ffffffffffffffffffffff00n);
 }
 
 /* pi computation */

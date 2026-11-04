@@ -62,7 +62,7 @@ PREFIX?=/usr/local
 #CONFIG_TSAN=y
 
 # TEST262 bootstrap config: commit id and shallow "since" parameter
-TEST262_COMMIT?=7ab7fafa0003f73fc85c1b95d88094d33f7eb8bd
+TEST262_COMMIT?=91c70759363c46557b694792bf34a2551a7af5ba
 TEST262_SINCE?=2025-09-01
 
 OBJDIR=.obj
@@ -133,13 +133,15 @@ else ifdef CONFIG_COSMO
   CC=cosmocc
   # cosmocc does not correct support -MF
   CFLAGS=-g -Wall #-MMD -MF $(OBJDIR)/$(@F).d
-  CFLAGS += -Wno-array-bounds -Wno-format-truncation
+  CFLAGS += -Wno-array-bounds -Wno-format-truncation -Wno-infinite-recursion
   AR=cosmoar
 else
   HOST_CC=gcc
   CC=$(CROSS_PREFIX)gcc
   CFLAGS+=-g -Wall -MMD -MF $(OBJDIR)/$(@F).d
   CFLAGS += -Wno-array-bounds -Wno-format-truncation -Wno-infinite-recursion
+  check_warning = $(shell $(CC) $(1) -c -x c /dev/null -o /dev/null 2>/dev/null && echo $(1))
+  CFLAGS += $(call check_warning, -Wbidi-chars=unpaired)
   ifdef CONFIG_LTO
     AR=$(CROSS_PREFIX)gcc-ar
   else

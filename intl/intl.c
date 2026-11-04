@@ -135,7 +135,7 @@ const char *intl_all_numbering_systems[] = {
 const int intl_all_numbering_systems_count = countof(intl_all_numbering_systems);
 
 const char *intl_supported_collations[] = {
-    "eor", "phonebk"
+    "emoji", "eor", "phonebk"
 };
 const int intl_supported_collations_count = countof(intl_supported_collations);
 
@@ -1194,8 +1194,8 @@ char *canonicalize_locale(JSContext *ctx, const char *locale)
                 const char *sub = subtags[ext_blocks[e].start + j];
                 int slen = (int)strlen(sub);
                 /* u-extension: canonicalize yes -> true for specific keys, then strip true */
-                if (singleton == 'u' && slen == 2 && is_alpha(sub, 1) &&
-                    (is_alpha(sub + 1, 1) || is_digit(sub + 1, 1))) {
+                if (singleton == 'u' && slen == 2 && is_alphanum(sub, 1) &&
+                    is_alpha(sub + 1, 1)) {
                     int skip_value = 0;
                     const char *value = NULL;
                     if (j + 1 < ext_blocks[e].len) {
